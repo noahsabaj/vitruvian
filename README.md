@@ -6,12 +6,20 @@
 
 ## Status
 
-**Phase 1 — Simulation Infrastructure.** M0.1 and M0.2 complete as of
-2026-04-16: `uv` project, Python 3.12, `mujoco` + `mujoco-mjx` +
-`jax[cuda12]` + `brax` installed, GPU (RTX 4060 Ti) confirmed live,
-`mujoco_menagerie` vendored under [`external/`](external/), Unitree G1
-parses and steps. Next up: M0.3 (viewer), M0.4 (playground env), M1
-(PPO walker).
+**Phase 1 closed — G1 walks** (2026-04-16). All five Phase 1
+milestones (M0.1–M0.4 + M1) complete; the PPO policy tracks the
+commanded joystick velocity on `G1JoystickFlatTerrain` with no falls,
+user-confirmed on the final rollout GIF.
+
+Under [ADR 006](docs/decisions/006-g1-reference-body.md), **Unitree G1
+is Vitruvian's reference body for the foreseeable future** — the
+project builds the software substrate (frozen priors + plastic world
+model + self-learning) on top of G1 rather than designing its own
+robot.
+
+Next up: **Phase 3** (world models). First milestone is M2 — add a
+simulated head camera to G1 so visual observations flow through the
+training pipeline.
 
 - **Plan:** [`docs/roadmap.md`](docs/roadmap.md)
 - **Thesis:** [`docs/thesis.md`](docs/thesis.md)

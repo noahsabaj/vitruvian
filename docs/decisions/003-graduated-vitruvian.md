@@ -79,16 +79,37 @@ candidate lists are updated:
 
 ### Visual encoders (frozen)
 
+- **V-JEPA 2.1** — arXiv 2603.14482, March 2026 (Mur-Labadia et al.,
+  Meta/FAIR). *Current primary candidate for the temporal / video
+  prior.* Key additions over V-JEPA 2: dense predictive loss where
+  both visible and masked tokens contribute to the training signal,
+  deep self-supervision across multiple intermediate encoder layers,
+  multi-modal image/video tokenizers, and scaling improvements.
+  Crucially for us: **+20 points in real-robot grasping success rate
+  vs V-JEPA 2 AC**, which is the benchmark that most closely matches
+  Vitruvian's eventual embodied usage pattern. License: **CC-BY-NC-ND
+  4.0** (non-commercial, no-derivatives) — see license note at the
+  end of this section.
+- **V-JEPA 2** — arXiv 2506.09985, June 2025
+  (`facebookresearch/vjepa2`). Supersedable baseline kept for
+  comparison only.
 - **DINOv3** — arXiv 2508.10104, Aug 2025. Released with
-  commercial-license weights at `facebookresearch/dinov3`. Strongest on
-  per-frame dense spatial features.
-- **V-JEPA 2** — arXiv 2506.09985, June 2025 (`facebookresearch/vjepa2`);
-  **V-JEPA 2.1** March 2026. Strongest on temporal /
-  motion-dependent features.
-- **Consensus (per arXiv 2509.21595):** DINOv3 and V-JEPA 2 are
-  complementary, not rivals. Vitruvian's plan is to carry **both** —
-  DINOv3 for dense spatial priors, V-JEPA 2 for the world-model
+  **commercial-license** weights at `facebookresearch/dinov3`.
+  Strongest on per-frame dense spatial features. Primary candidate for
+  the dense spatial prior.
+- **Consensus (per arXiv 2509.21595):** DINOv3 and the V-JEPA lineage
+  are complementary, not rivals. Vitruvian's plan is to carry
+  **both** — DINOv3 for dense spatial priors (static affordance,
+  goal-image matching) and V-JEPA 2.1 for the world-model temporal
   latent — rather than pick one.
+
+**License note on V-JEPA 2.1.** The CC-BY-NC-ND weights restrict
+commercial use and derivatives. For our personal-research scope
+(Apache 2.0 code + no product shipped) this is fine, but anyone
+forking Vitruvian who wants to productize cannot redistribute bundled
+V-JEPA 2.1 weights. DINOv3 has no such restriction; if commercial use
+ever becomes a concern, the stack should degrade gracefully to
+DINOv3-only at the cost of the 20-point grasping gap.
 
 ### World model (plastic)
 

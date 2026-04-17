@@ -78,12 +78,21 @@ Six-month-later us needs to be able to reconstruct the reasoning.
 
 ## What we are building
 
-A roughly 65 cm, 20 DoF humanoid, hobby-servo class, 3D-printed
-structure, with a simulation-first software stack built around a
-continuously-learning world model running on top of frozen perceptual
-and motor priors.
+A simulation-first software stack for embodied machine intelligence —
+a continuously-learning world model running on top of frozen perceptual
+and motor priors — tested against a real humanoid morphology.
 
-In that order: **sim first, robot second, research third.**
+For the foreseeable future that morphology is **Unitree G1** (see
+[ADR 006](decisions/006-g1-reference-body.md)). The project does not
+build its own robot; it uses G1 as the reference body and works on
+the *software substrate* that runs above any humanoid shape.
+
+The thesis is unchanged: we are studying **intelligence in humanoid
+form**. G1 is the humanoid we happen to have. If a suitable open
+universal-humanoid design emerges later, the stack ports; the
+research stands either way.
+
+In that order: **research first, hardware contingent.**
 
 ## Vocabulary
 
