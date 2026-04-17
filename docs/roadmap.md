@@ -48,12 +48,17 @@ Prove the entire simulation + RL pipeline end-to-end on a known-good
 humanoid, on local hardware, reproducibly. No Vitruvian-specific modeling
 yet.
 
+GPU backend: **NVIDIA Warp** (via `mujoco_warp`) is the default in
+`mujoco_playground` 0.2.0 (March 2026) and roughly 250× faster than
+MJX-JAX on locomotion. We install both — Warp for perf, MJX for
+gradient support and non-NVIDIA portability.
+
 | Milestone | Description |
 |---|---|
 | **M0.1** | `uv` project initialized, Python 3.12, monorepo layout, docs skeleton, first commit, pushed to private GitHub. |
-| **M0.2** | `mujoco`, `mujoco-mjx`, `jax[cuda12]`, `brax` installed. `jax.devices()` shows the RTX 4060 Ti. `mujoco_menagerie` added as submodule. |
+| **M0.2** | `mujoco`, `mujoco-mjx`, `mujoco-warp`, `warp-lang`, `jax[cuda12]`, `brax` installed. JAX and Warp both see the RTX 4060 Ti. `mujoco_menagerie` added as submodule. |
 | **M0.3** | Unitree G1 loads in the MuJoCo viewer, random torques applied, physics confirmed, screen capture saved. |
-| **M0.4** | `mujoco_playground` installed, G1 locomotion environment instantiates, random policy rolls out successfully. |
+| **M0.4** | `mujoco_playground` installed, G1 locomotion environment instantiates with the Warp backend, random policy rolls out successfully. |
 | **M1**   | PPO trains G1 to walk forward at 0.5 m/s. Training reproducible via a single command. wandb run preserved. Video of the trained policy saved. |
 
 **Exit criteria:** M1 met, video committed or linked, wandb dashboard
@@ -64,21 +69,41 @@ bookmarked.
 ### Phase 2 — Vitruvian Embodiment
 
 Design the MVH (~20 DoF, ~60-70 cm, hobby-servo class), export to
-URDF/MJCF, retrain PPO on the Vitruvian model itself. This is where
-mechanical design constraints start feeding back into the policy problem.
+URDF/MJCF, retrain locomotion on the Vitruvian model itself. This is
+where mechanical design constraints start feeding back into the policy
+problem.
 
-Not scoped in detail yet.
+One explicit milestone: **FastTD3 baseline.** Before or alongside the
+Vitruvian URDF, reproduce FastTD3 on Unitree G1/H1 per arXiv 2505.22642
+and 2512.01996. As of 2026, FastTD3 beats PPO/SAC/TD-MPC2/DreamerV3 on
+humanoid locomotion on wall-clock and is the new default to have
+running before moving to world-model experiments.
+
+Design reference: **ToddlerBot** (Stanford, CoRL 2025). 0.56 m, 3.4 kg,
+30 DoF, fully 3D-printed, <$6k. Present in our menagerie as
+`toddlerbot_2xc` / `toddlerbot_2xm` — we can train on it in sim as a
+Vitruvian stand-in while our own URDF is in progress. Berkeley Humanoid
+Lite is secondary reference for cycloidal-gearbox mechanical patterns
+once/if we graduate from hobby servos.
+
+Not scoped in milestones yet.
 
 ---
 
 ### Phase 3 — World Models
 
-Replace PPO with Dreamer V3 (or TD-MPC2), mount a simulated head camera,
-attach a frozen visual encoder (V-JEPA 2 or DINOv3). This is where the
-graduated architecture lands in earnest: frozen evolutionary priors +
-plastic world model.
+Replace the policy-only baseline with **Dreamer 4** (arXiv 2509.24527,
+Sep 2025 — the current Hafner-lineage SOTA, superseding Dreamer V3),
+with **TD-MPC2** carried as a parallel track. Mount a simulated head
+camera; attach **DINOv3** (dense spatial) and **V-JEPA 2** (temporal)
+as complementary frozen visual encoders. This is where the graduated
+architecture lands in earnest: frozen evolutionary-equivalent priors +
+plastic world model running continuous self-supervised prediction.
 
-Not scoped in detail yet.
+See [`ADR 003`](decisions/003-graduated-vitruvian.md) (with the
+2026-04-16 addendum) for candidate lists.
+
+Not scoped in milestones yet.
 
 ---
 
@@ -96,6 +121,20 @@ Not scoped in detail yet.
 
 3D-printed structure, Dynamixel XL330-class servos, RPi 5 onboard,
 sim-to-real via domain randomization.
+
+**Primary design reference: ToddlerBot** (Stanford, CoRL 2025). Closest
+public match to the Vitruvian target envelope (0.56 m, 3.4 kg, 30 DoF,
+fully 3D-printed, <$6k). Source: `hshi74/toddlerbot`. Present in sim as
+`external/mujoco_menagerie/toddlerbot_{2xc,2xm}`.
+
+**Secondary: Berkeley Humanoid Lite** (RSS 2025,
+`HybridRobotics/Berkeley-Humanoid-Lite`). BLDC-class, larger (~0.8 m,
+16 kg), BOM ~$4.3k. Useful for cycloidal-gearbox patterns if/when we
+graduate from hobby servos.
+
+(**K-Scale Labs / Zeroth Bot is dead** — shut down Nov 2025. Repos
+still at `kscalelabs` under CERN-OHL-S-2.0 / MIT for archaeological
+reference.)
 
 Deliberately distant. Hardware is last.
 
@@ -142,8 +181,13 @@ The 8 GB VRAM is the first real constraint to watch in Phase 3+.
 
 ## Open questions carried forward
 
-- Which visual encoder in Phase 3: V-JEPA 2, DINOv3, or other?
 - At what point does language enter the stack, and how?
 - Which self-learning signal to prioritize in Phase 4: RND vs
-  Plan2Explore vs empowerment?
+  Plan2Explore vs empowerment vs LLM-driven intrinsic reward
+  (VSIMR+LLM, IMAGINE, MERCI)?
 - When (if ever) does a "frozen" prior become unfrozen, and on what signal?
+- Are DINOv3 + V-JEPA 2 the right pair, or does V-JEPA 2.1 / VL-JEPA
+  consolidate the stack?
+- Dreamer 4 reimplementation choice: `nicklashansen/dreamer4` (PyTorch,
+  DMControl-targeted) vs `lucidrains/dreamer4` vs wait for an official
+  Hafner release.

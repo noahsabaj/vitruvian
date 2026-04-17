@@ -66,6 +66,60 @@ components are the perceptual / motor substrate; they are explicitly
 
 ## Open questions
 
-- Which visual encoder: V-JEPA 2 vs DINOv3 vs other?
+- Which visual encoder(s) — see the 2026-04-16 addendum below.
 - Do we ever *un*-freeze a prior, and under what signal?
 - Where does language fit in the plastic / frozen split?
+
+---
+
+## Addendum — 2026-04-16 (post-cutoff currency check)
+
+Research review confirmed the thesis of this ADR is intact. The
+candidate lists are updated:
+
+### Visual encoders (frozen)
+
+- **DINOv3** — arXiv 2508.10104, Aug 2025. Released with
+  commercial-license weights at `facebookresearch/dinov3`. Strongest on
+  per-frame dense spatial features.
+- **V-JEPA 2** — arXiv 2506.09985, June 2025 (`facebookresearch/vjepa2`);
+  **V-JEPA 2.1** March 2026. Strongest on temporal /
+  motion-dependent features.
+- **Consensus (per arXiv 2509.21595):** DINOv3 and V-JEPA 2 are
+  complementary, not rivals. Vitruvian's plan is to carry **both** —
+  DINOv3 for dense spatial priors, V-JEPA 2 for the world-model
+  latent — rather than pick one.
+
+### World model (plastic)
+
+- **Dreamer 4** (arXiv 2509.24527, Sep 2025) — current Hafner-lineage
+  SOTA, supersedes Dreamer V3. No official repo yet;
+  `nicklashansen/dreamer4` is the best unofficial PyTorch port and
+  already targets DMControl continuous control. **Primary Phase 3
+  candidate.**
+- **TD-MPC2** — still current; worth carrying as a parallel track.
+- **Puppeteer** (arXiv 2405.18418, ICLR 2025) — hierarchical TD-MPC2
+  variant explicitly built for whole-body humanoid visual control.
+  Worth studying once Phase 3 begins.
+
+### Motion priors
+
+- **AMASS** remains the base standard.
+- Augment with **LAFAN1** (combat / parkour) and **Motion-X**
+  (whole-body incl. hands / face) for 2026 breadth.
+- **PULSE** and **PHC** (Luo et al.) as standard latent controllers
+  over AMASS.
+
+### Note on RL baseline (affects Phase 1 → Phase 2)
+
+- **FastTD3** (arXiv 2505.22642, May 2025) beats
+  PPO/SAC/TD-MPC2/DreamerV3 on Unitree G1/H1 locomotion benchmarks on
+  wall-clock. "Sim-to-Real Humanoid Locomotion in 15 Minutes" (arXiv
+  2512.01996) is the definitive 2025 result.
+- PPO is still the default in `mujoco_playground`, so M1 correctly
+  targets it as the reproduce-the-baseline milestone. FastTD3 is
+  scheduled in the roadmap as a Phase-2 addition.
+
+All of the above are candidates, not commitments — the thesis of this
+ADR (frozen evolutionary-equivalent priors + plastic self-learning
+world model) does not change.
