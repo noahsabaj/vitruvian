@@ -10,6 +10,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "brax>=0.14.2",
+    "imageio>=2.37.3",
     "jax[cuda12]>=0.10.0",
     "mujoco>=3.7.0",
     "mujoco-mjx>=3.7.0",
@@ -23,3 +24,8 @@ vitruvian = "vitruvian:main"
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]
 build-backend = "uv_build"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
