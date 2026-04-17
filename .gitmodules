@@ -1,3 +1,6 @@
 [submodule "external/mujoco_menagerie"]
 	path = external/mujoco_menagerie
 	url = https://github.com/google-deepmind/mujoco_menagerie
+[submodule "external/le-wm"]
+	path = external/le-wm
+	url = https://github.com/lucas-maes/le-wm

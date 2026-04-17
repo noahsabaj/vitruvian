@@ -114,7 +114,7 @@ See [ADR 003](decisions/003-graduated-vitruvian.md) (with the
 |---|---|
 | **M2** | Add a simulated head camera to the G1 env; render its feed during training; confirm observations flow through the pipeline. |
 | **M3** | Wire up **DINOv3** (dense / spatial) and/or **V-JEPA 2.1** (temporal, +20pt real-robot grasping vs V-JEPA 2) as a frozen visual encoder; confirm we can process camera observations through it and surface the latent to the policy. |
-| **M4** | Replace PPO with **Dreamer 4** (or TD-MPC2); retrain G1 using the world-model loop with the visual latent as part of the observation. |
+| **M4** | Replace PPO with **LeWM** (JEPA world model, per [ADR 007](decisions/007-lewm-world-model.md)). Distills the M1 PPO walker into a pre-collected expert dataset, trains a LeWM world model on it, then plans against the learned latent at eval time. Multi-session research arc — see ADR 007 for risk discussion. |
 | **M5** | Reward ablation: how much of G1's walking behavior survives with the `tracking_lin_vel` reward zeroed out and only self-supervised prediction + intrinsic-motivation signals driving exploration? First test of the self-learning commitment. (Bridges into Phase 4.) |
 
 ---
@@ -192,6 +192,7 @@ The 8 GB VRAM is the first real constraint to watch in Phase 3+.
 4. [ADR 004 — Weights & Biases for experiment tracking](decisions/004-experiment-tracking-wandb.md)
 5. [ADR 005 — Apache 2.0 license](decisions/005-license-apache-2.md)
 6. [ADR 006 — Unitree G1 as Vitruvian's reference body](decisions/006-g1-reference-body.md)
+7. [ADR 007 — LeWorldModel as the plastic world model](decisions/007-lewm-world-model.md)
 
 ---
 
