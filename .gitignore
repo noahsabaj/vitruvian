@@ -1,0 +1,74 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Build / packaging ---
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Experiment tracking / ML artifacts ---
+wandb/
+mlruns/
+runs/
+tb_logs/
+tensorboard/
+outputs/
+checkpoints/
+logs/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.h5
+
+# --- Large data ---
+data/
+datasets/
+
+# --- Simulation / rendering outputs ---
+# (inline recordings in docs/ are fine; bulk outputs are not)
+videos/
+recordings/
+renders/
+
+# --- uv ---
+# Lockfile IS tracked intentionally.

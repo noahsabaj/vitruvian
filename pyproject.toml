@@ -1,0 +1,18 @@
+[project]
+name = "vitruvian"
+version = "0.1.0"
+description = "Minimum viable humanoid as a substrate for machine intelligence."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "noahsabaj", email = "noahsabaj@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+vitruvian = "vitruvian:main"
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9"]
+build-backend = "uv_build"
