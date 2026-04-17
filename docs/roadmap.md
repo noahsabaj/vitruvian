@@ -114,7 +114,7 @@ See [ADR 003](decisions/003-graduated-vitruvian.md) (with the
 |---|---|
 | **M2** | Add a simulated head camera to the G1 env; render its feed during training; confirm observations flow through the pipeline. |
 | **M3** | Wire up **DINOv3** (dense / spatial) and/or **V-JEPA 2.1** (temporal, +20pt real-robot grasping vs V-JEPA 2) as a frozen visual encoder; confirm we can process camera observations through it and surface the latent to the policy. |
-| **M4** | Replace PPO with **LeWM** (JEPA world model, per [ADR 007](decisions/007-lewm-world-model.md)). Distills the M1 PPO walker into a pre-collected expert dataset, trains a LeWM world model on it, then plans against the learned latent at eval time. Multi-session research arc — see ADR 007 for risk discussion. |
+| **M4** | Replace PPO with **LeWM + HWM** hierarchical planning ([ADR 007](decisions/007-lewm-world-model.md) + [ADR 008](decisions/008-hwm-planning-layer.md)). M4.1-3 already wired the low-level LeWM world model on a 20k-step G1 expert dataset. M4.4 adds the high-level macro-action world model (HWM recipe) on top of LeWM's frozen encoder, then hierarchical CEM plans primitive actions toward goal-image latents. Research arc: one session per M4.4a-d (vendor HWM, train high level, implement hierarchical CEM, full eval). |
 | **M5** | Reward ablation: how much of G1's walking behavior survives with the `tracking_lin_vel` reward zeroed out and only self-supervised prediction + intrinsic-motivation signals driving exploration? First test of the self-learning commitment. (Bridges into Phase 4.) |
 
 ---
@@ -193,6 +193,7 @@ The 8 GB VRAM is the first real constraint to watch in Phase 3+.
 5. [ADR 005 — Apache 2.0 license](decisions/005-license-apache-2.md)
 6. [ADR 006 — Unitree G1 as Vitruvian's reference body](decisions/006-g1-reference-body.md)
 7. [ADR 007 — LeWorldModel as the plastic world model](decisions/007-lewm-world-model.md)
+8. [ADR 008 — Hierarchical World Models (HWM) as the planning layer](decisions/008-hwm-planning-layer.md)
 
 ---
 
