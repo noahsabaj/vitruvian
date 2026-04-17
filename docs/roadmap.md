@@ -42,7 +42,7 @@ local git repo.
 
 ---
 
-### Phase 1 — Simulation Infrastructure
+### Phase 1 — Simulation Infrastructure *(complete, 2026-04-16)*
 
 Prove the entire simulation + RL pipeline end-to-end on a known-good
 humanoid, on local hardware, reproducibly. No Vitruvian-specific modeling
@@ -53,16 +53,16 @@ GPU backend: **NVIDIA Warp** (via `mujoco_warp`) is the default in
 MJX-JAX on locomotion. We install both — Warp for perf, MJX for
 gradient support and non-NVIDIA portability.
 
-| Milestone | Description |
-|---|---|
-| **M0.1** | `uv` project initialized, Python 3.12, monorepo layout, docs skeleton, first commit, pushed to private GitHub. |
-| **M0.2** | `mujoco`, `mujoco-mjx`, `mujoco-warp`, `warp-lang`, `jax[cuda12]`, `brax` installed. JAX and Warp both see the RTX 4060 Ti. `mujoco_menagerie` added as submodule. |
-| **M0.3** | Unitree G1 loads in the MuJoCo viewer, random torques applied, physics confirmed, screen capture saved. |
-| **M0.4** | `mujoco_playground` installed, G1 locomotion environment instantiates with the Warp backend, random policy rolls out successfully. |
-| **M1**   | PPO trains G1 to walk forward at 0.5 m/s. Training reproducible via a single command. wandb run preserved. Video of the trained policy saved. |
+| Milestone | Status | Description |
+|---|---|---|
+| **M0.1** | ✓ | `uv` project initialized, Python 3.12, monorepo layout, docs skeleton, first commit, pushed to private GitHub. |
+| **M0.2** | ✓ | `mujoco`, `mujoco-mjx`, `mujoco-warp`, `warp-lang`, `jax[cuda12]`, `brax` installed. JAX and Warp both see the RTX 4060 Ti. `mujoco_menagerie` added as submodule. |
+| **M0.3** | ✓ | Unitree G1 loads in the MuJoCo viewer, random torques applied, physics confirmed, screen capture saved. |
+| **M0.4** | ✓ | `mujoco_playground` installed, G1 locomotion environment instantiates with the Warp backend, random policy rolls out successfully. |
+| **M1**   | ✓ | PPO trained G1 to walk (eval_reward +3.70 at 43 M steps, user-confirmed walking with no falls). Training reproducible via a single command. wandb runs preserved ([smoke](https://wandb.ai/noahsabaj-myself/vitruvian/runs/2be0vxgu), [full](https://wandb.ai/noahsabaj-myself/vitruvian/runs/oo2h5y6t)). Video of the trained policy saved to `docs/journal/assets/2026-04-16-m1-g1-full.gif`. |
 
-**Exit criteria:** M1 met, video committed or linked, wandb dashboard
-bookmarked.
+**Phase 1 exit criteria met** — video committed, wandb dashboards
+bookmarked, full story in [`docs/journal/2026-04-16.md`](journal/2026-04-16.md).
 
 ---
 
