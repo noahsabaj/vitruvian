@@ -4,3 +4,6 @@
 [submodule "external/le-wm"]
 	path = external/le-wm
 	url = https://github.com/lucas-maes/le-wm
+[submodule "external/hwm"]
+	path = external/hwm
+	url = https://github.com/kevinghst/HWM_PLDM
