@@ -64,6 +64,18 @@ CKPT_DIR = ROOT / "checkpoints"
 ASSETS = ROOT / "docs" / "journal" / "assets"
 ENV_NAME = "G1JoystickFlatTerrain"
 
+# Bump njmax (constraint-buffer size) from the upstream default of 90
+# to 96: G1 contact-heavy states observed overflow of 3-4 rows, which
+# silently drops contacts. Cost is ~2 MB VRAM at 1024 envs, benefit is
+# no dropped contacts during training.
+ENV_OVERRIDES: dict = {"njmax": 96}
+
+# Short viz rollouts logged at each eval boundary: 150 frames = 3 s at
+# the env's 50 Hz control rate; 320x240 to keep each GIF upload small.
+VIZ_NUM_FRAMES = 150
+VIZ_W, VIZ_H = 320, 240
+VIZ_DIR = Path("/tmp/vitruvian-viz")
+
 
 def make_network_factory(cfg):
     return functools.partial(
@@ -97,6 +109,82 @@ def make_progress_fn(start_time: float, use_wandb: bool):
         )
 
     return progress
+
+
+def make_viz_callback(wandb_on: bool):
+    """Return a `policy_params_fn` callback for brax's ppo.train. At
+    every eval boundary the callback rolls out the current policy for
+    3 s in a single-env instance, renders to a GIF, and uploads it to
+    wandb under `rollout/video`. Failures are caught and logged — viz
+    never breaks training.
+
+    If wandb is off, returns a no-op callback.
+    """
+    if not wandb_on:
+        return lambda *_args, **_kwargs: None
+
+    import imageio.v2 as imageio
+    import mujoco
+    import wandb
+
+    mjcf = ROOT / "external" / "mujoco_menagerie" / "unitree_g1" / "scene.xml"
+    mj_model = mujoco.MjModel.from_xml_path(str(mjcf))
+    mj_data = mujoco.MjData(mj_model)
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(cam)
+    cam.distance = 3.0
+    cam.azimuth = 110.0
+    cam.elevation = -12.0
+    cam.lookat[:] = np.array([0.0, 0.0, 0.7])
+    renderer = mujoco.Renderer(mj_model, height=VIZ_H, width=VIZ_W)
+
+    # Single-env instance for viz — lets the policy's own physics drive
+    # qpos/qvel into the CPU-side MjData for rendering. Warp reuses the
+    # batch=1 kernels we compiled in M0.3/M0.4, so first call is cheap.
+    viz_env = registry.load(ENV_NAME, config_overrides=ENV_OVERRIDES)
+    viz_reset = jax.jit(viz_env.reset)
+    viz_step = jax.jit(viz_env.step)
+
+    VIZ_DIR.mkdir(parents=True, exist_ok=True)
+
+    def callback(current_step: int, make_policy, params) -> None:
+        try:
+            t0 = time.time()
+            policy = make_policy(params, deterministic=True)
+            policy_jit = jax.jit(policy)
+            rng = jax.random.PRNGKey(0)
+            state = viz_reset(rng)
+
+            frames = []
+            for _ in range(VIZ_NUM_FRAMES):
+                rng, act_rng = jax.random.split(rng)
+                action, _ = policy_jit(state.obs, act_rng)
+                state = viz_step(state, action)
+                mjx_data = getattr(state, "data", None) or getattr(
+                    state, "pipeline_state", None
+                )
+                if mjx_data is None:
+                    return
+                mj_data.qpos[:] = np.array(mjx_data.qpos)
+                mj_data.qvel[:] = np.array(mjx_data.qvel)
+                mujoco.mj_forward(mj_model, mj_data)
+                renderer.update_scene(mj_data, camera=cam)
+                frames.append(renderer.render().copy())
+
+            gif_path = VIZ_DIR / f"progress-{current_step:010d}.gif"
+            imageio.mimsave(str(gif_path), frames, fps=50, loop=0)
+            wandb.log(
+                {"rollout/video": wandb.Video(str(gif_path))}, step=current_step
+            )
+            size_kb = gif_path.stat().st_size // 1024
+            print(
+                f"    [viz] step {current_step:>11}: "
+                f"3s rollout -> wandb  ({time.time() - t0:.1f}s, {size_kb} KB)"
+            )
+        except Exception as e:  # viz must never break training
+            print(f"    [viz] FAILED at step {current_step}: {type(e).__name__}: {e}")
+
+    return callback
 
 
 def render_rollout(
@@ -165,6 +253,8 @@ def main() -> None:
 
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS.mkdir(parents=True, exist_ok=True)
+    save_dir = CKPT_DIR / args.run_name
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = locomotion_params.brax_ppo_config(ENV_NAME)
     cfg.num_envs = args.num_envs
@@ -180,8 +270,8 @@ def main() -> None:
 
     # Per upstream playground train_jax_ppo.py: pass unwrapped envs and
     # let brax call wrap_env_fn at the right point in its wrapping stack.
-    env = registry.load(ENV_NAME)
-    eval_env = registry.load(ENV_NAME)
+    env = registry.load(ENV_NAME, config_overrides=ENV_OVERRIDES)
+    eval_env = registry.load(ENV_NAME, config_overrides=ENV_OVERRIDES)
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -232,6 +322,8 @@ def main() -> None:
         normalize_observations=cfg.normalize_observations,
         num_resets_per_eval=cfg.num_resets_per_eval,
         progress_fn=make_progress_fn(start, use_wandb=use_wandb),
+        policy_params_fn=make_viz_callback(use_wandb),
+        save_checkpoint_path=str(save_dir),
         seed=args.seed,
         wrap_env_fn=wrapper.wrap_for_brax_training,
     )
