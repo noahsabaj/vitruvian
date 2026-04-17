@@ -1,0 +1,15 @@
+--- load G1JoystickFlatTerrain ---
+env class:       Joystick
+obs_size:        {'privileged_state': (216,), 'state': (103,)}
+action_size:     29
+control dt:      0.02s (50 Hz)
+reset obs:       privileged_state:(216,), state:(103,)
+reset reward:    0.000  done: False
+one-step reward: 0.029  done: False
+
+--- parallel throughput (each batch in a fresh subprocess) ---
+     64 envs x 200 steps =     12800 env-steps in   5.25s ->       2.4 kEnvSteps/s
+    256 envs x 200 steps =     51200 env-steps in   5.68s ->       9.0 kEnvSteps/s
+    512 envs x 200 steps =    102400 env-steps in   6.38s ->      16.1 kEnvSteps/s
+   1024 envs x 200 steps =    204800 env-steps in   7.89s ->      25.9 kEnvSteps/s
+   2048 envs x 200 steps =    409600 env-steps in  11.76s ->      34.8 kEnvSteps/s
