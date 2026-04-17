@@ -55,6 +55,7 @@ jax.device_put_replicated = _device_put_replicated_shim  # type: ignore[attr-def
 import imageio.v2 as imageio
 import mujoco
 import numpy as np
+from brax.training import checkpoint as brax_checkpoint
 from brax.training.acme import running_statistics
 from brax.training.agents.ppo import networks as ppo_networks
 
@@ -63,6 +64,26 @@ from mujoco_playground.config import locomotion_params
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_NAME = "G1JoystickFlatTerrain"
+# Match the training env config so rollout physics is identical to
+# what the policy was optimized against.
+ENV_OVERRIDES: dict = {"njmax": 96}
+
+
+def load_params(ckpt_path: Path):
+    """Load PPO params from either a pickle file (end-of-training output of
+    our m1_train.py) or a brax/orbax checkpoint directory (mid-training
+    snapshot created by save_checkpoint_path). Both return the same
+    3-tuple shape brax expects: (normalizer, policy, value)."""
+    if ckpt_path.is_dir():
+        # Orbax rejects relative paths.
+        params = brax_checkpoint.load(str(ckpt_path.resolve()))
+        print(f"loaded orbax checkpoint dir {ckpt_path.name}")
+        return params
+    with ckpt_path.open("rb") as f:
+        params = pickle.load(f)
+    size_mb = ckpt_path.stat().st_size / 1024 / 1024
+    print(f"loaded pickle {ckpt_path.name}: {size_mb:.1f} MB")
+    return params
 
 
 def build_inference_fn(params, env):
@@ -90,11 +111,9 @@ def build_inference_fn(params, env):
 
 
 def render(ckpt_path: Path, out_path: Path, num_frames: int, seed: int) -> None:
-    with ckpt_path.open("rb") as f:
-        params = pickle.load(f)
-    print(f"loaded {ckpt_path.name}: {ckpt_path.stat().st_size / 1024 / 1024:.1f} MB")
+    params = load_params(ckpt_path)
 
-    env = registry.load(ENV_NAME)
+    env = registry.load(ENV_NAME, config_overrides=ENV_OVERRIDES)
     inference_fn = build_inference_fn(params, env)
 
     mjcf = ROOT / "external" / "mujoco_menagerie" / "unitree_g1" / "scene.xml"
@@ -137,9 +156,14 @@ def render(ckpt_path: Path, out_path: Path, num_frames: int, seed: int) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(str(out_path), frames, fps=50, loop=0)
     wall = time.perf_counter() - t0
+    abs_out = out_path.resolve()
+    try:
+        display_path = abs_out.relative_to(ROOT)
+    except ValueError:
+        display_path = abs_out
     print(
         f"rendered {num_frames} frames in {wall:.1f}s -> "
-        f"{out_path.relative_to(ROOT)} ({out_path.stat().st_size // 1024} KB)"
+        f"{display_path} ({abs_out.stat().st_size // 1024} KB)"
     )
 
 

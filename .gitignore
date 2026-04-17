@@ -72,3 +72,7 @@ renders/
 
 # --- uv ---
 # Lockfile IS tracked intentionally.
+
+# --- stray tool outputs ---
+# Some tool creates an empty tea_debug.log at repo root on commit. No idea which.
+tea_debug.log
