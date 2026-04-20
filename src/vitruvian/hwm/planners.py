@@ -214,6 +214,9 @@ class LowLevelPlanner(nn.Module):
         action_low: float = -1.0,
         action_high: float = 1.0,
         device: str = "cuda",
+        mc_dropout_k: int = 1,
+        beta_unc: float = 0.0,
+        value_head: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.jepa = lewm_jepa
@@ -225,9 +228,21 @@ class LowLevelPlanner(nn.Module):
         self.lambda_ = lambda_
         self.iterations = iterations
         self.history_size = history_size
+        # If provided, replace terminal-MSE cost with a learned
+        # value-function distance: cost = ||f_ψ(pred_final) - f_ψ(goal)||².
+        # See Destrade et al. 2601.00844 (VF_quasi).
+        self.value_head = value_head
         self.action_low = action_low
         self.action_high = action_high
         self.device = device
+        # PLDM-style uncertainty regularization: run the predictor
+        # ``mc_dropout_k`` times with dropout enabled per MPPI candidate,
+        # add ``beta_unc * Var_k(f^k_rollout)`` to the goal cost to
+        # penalize actions that land in regions where the world model
+        # is uncertain (off training-distribution). See
+        # arXiv:2502.14819 eq. 6.
+        self.mc_dropout_k = int(mc_dropout_k)
+        self.beta_unc = float(beta_unc)
 
         if subgoal_emb.shape[-1] != backbone.output_dim:
             raise ValueError(
@@ -238,6 +253,10 @@ class LowLevelPlanner(nn.Module):
 
         # Warm-started nominal trajectory for receding-horizon reuse.
         self.U: torch.Tensor | None = None
+        # Deterministic counter for seeding the plan-internal noise
+        # generator; ensures the candidate noise cloud is identical
+        # across mc_dropout_k settings for fair β ablations.
+        self._plan_call_idx: int = 0
 
     def set_subgoal(self, subgoal_emb: torch.Tensor) -> None:
         self.subgoal_emb = subgoal_emb.detach().to(self.device).view(-1)
@@ -311,6 +330,14 @@ class LowLevelPlanner(nn.Module):
         best_U = U.clone()
         best_cost = torch.tensor(float("inf"), device=device)
 
+        def _set_dropout(mode: bool) -> None:
+            for m in self.jepa.modules():
+                if isinstance(m, torch.nn.Dropout):
+                    m.train(mode)
+
+        last_c_goal = None
+        last_c_unc = None
+
         for _ in range(self.iterations):
             noise = torch.randn(K, H, A, device=device) * self.noise_sigma
             candidates = (U.unsqueeze(0) + noise).clamp(
@@ -319,15 +346,59 @@ class LowLevelPlanner(nn.Module):
 
             future_KS = candidates.unsqueeze(0)  # (1, K, H, A)
             action_seq = torch.cat([hist_acts_KS, future_KS], dim=2)
-            # rollout mutates its `info` dict — build a fresh one each call.
+
+            # 1. Deterministic rollout (dropout off) → goal cost. Keeping
+            # this identical to the K=1 baseline preserves the walking
+            # behavior when β=0.
+            _set_dropout(False)
             info = {"pixels": pixels_KS.clone()}
             out = self.jepa.rollout(info, action_seq, history_size=HS)
+            pred_emb = out["predicted_emb"]  # (B, S, T_all, D)
+            pred_final_det = pred_emb[0, :, -1, :]  # (K, D)
+            if self.value_head is not None:
+                # VF_quasi cost: squared distance in the learned
+                # value-embedding space. Approximates -V*(pred_final, goal).
+                f_pred = self.value_head.f(pred_final_det)  # (K, d_v)
+                f_goal = self.value_head.f(self.subgoal_emb.unsqueeze(0))
+                c_goal = ((f_pred - f_goal) ** 2).sum(dim=-1)
+            else:
+                c_goal = (
+                    (pred_final_det - self.subgoal_emb) ** 2
+                ).sum(dim=-1)
 
-            pred_emb = out["predicted_emb"]  # (B, S, T_hist + horizon + 1, D)
-            # The last index is the terminal prediction.
-            pred_final = pred_emb[0, :, -1, :]  # (K, D)
+            # 2. MC rollouts (dropout on) → variance = uncertainty cost.
+            # Only evaluated if the caller enabled MC. Snapshot+restore
+            # the torch RNG state around the MC loop so dropout mask
+            # sampling doesn't drift the noise used for subsequent MPPI
+            # iterations — otherwise the β=0 K=M comparison isn't an
+            # ablation of β, it's an ablation of sample-path divergence.
+            M = max(1, self.mc_dropout_k)
+            if M > 1:
+                cpu_rng = torch.random.get_rng_state()
+                cuda_rng = (
+                    torch.cuda.get_rng_state()
+                    if device != "cpu"
+                    else None
+                )
+                _set_dropout(True)
+                pred_finals = []
+                for _m in range(M):
+                    info = {"pixels": pixels_KS.clone()}
+                    out = self.jepa.rollout(info, action_seq, history_size=HS)
+                    pred_emb = out["predicted_emb"]
+                    pred_finals.append(pred_emb[0, :, -1, :])
+                pred_stack = torch.stack(pred_finals, dim=0)  # (M, K, D)
+                c_unc = pred_stack.var(dim=0, unbiased=False).sum(dim=-1)
+                _set_dropout(False)
+                torch.random.set_rng_state(cpu_rng)
+                if cuda_rng is not None:
+                    torch.cuda.set_rng_state(cuda_rng)
+            else:
+                c_unc = torch.zeros_like(c_goal)
 
-            costs = ((pred_final - self.subgoal_emb) ** 2).sum(dim=-1)  # (K,)
+            costs = c_goal + self.beta_unc * c_unc  # (K,)
+            last_c_goal = c_goal
+            last_c_unc = c_unc
 
             beta = costs.min()
             weights = torch.exp(-(costs - beta) / self.lambda_)
@@ -342,9 +413,33 @@ class LowLevelPlanner(nn.Module):
                 best_cost = beta
                 best_U = candidates[costs.argmin()].clone()
 
+        # Dropout already turned off after each MC block; this is a
+        # no-op safety restore.
+        _set_dropout(False)
+
         self.U = U
         self.best_cost = float(best_cost)
         self.best_U = best_U
+        # Expose diagnostic stats so a caller can judge whether MC
+        # dropout variance carries useful signal. c_unc_range across
+        # candidates, relative to c_goal range, tells us whether β·unc
+        # can actually move MPPI's softmax weights.
+        if last_c_goal is not None:
+            self.best_c_goal = float(last_c_goal.min())
+            self.c_goal_min = float(last_c_goal.min())
+            self.c_goal_max = float(last_c_goal.max())
+        else:
+            self.best_c_goal = float("nan")
+            self.c_goal_min = float("nan")
+            self.c_goal_max = float("nan")
+        if last_c_unc is not None:
+            self.best_c_unc = float(last_c_unc.min())
+            self.c_unc_min = float(last_c_unc.min())
+            self.c_unc_max = float(last_c_unc.max())
+        else:
+            self.best_c_unc = 0.0
+            self.c_unc_min = 0.0
+            self.c_unc_max = 0.0
         return U
 
 

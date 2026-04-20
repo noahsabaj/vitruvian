@@ -143,15 +143,59 @@ def build_env_and_policy(ckpt_policy: Path | None, device: str, seed: int):
     from mujoco_playground import registry
     from mujoco_playground.config import locomotion_params
 
+    from scipy.spatial.transform import Rotation
+
+    def _look_at_quat(cam_offset, target_offset=(0.0, 0.0, 0.0)):
+        """Build a MuJoCo scalar-first quat so a camera at ``cam_offset``
+        (relative to the tracked body COM, world-frame) looks at
+        ``target_offset``. Works with TRACKCOM cameras whose quat is
+        interpreted in world frame."""
+        fwd = np.array(target_offset) - np.array(cam_offset)
+        fwd /= np.linalg.norm(fwd)
+        # MuJoCo cam looks along -Z local. Build basis (right, up, -fwd).
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        cam_up = np.cross(right, fwd)
+        R = np.column_stack([right, cam_up, -fwd])
+        # scipy returns (x, y, z, w); MuJoCo takes (w, x, y, z).
+        q = Rotation.from_matrix(R).as_quat()
+        return [float(q[3]), float(q[0]), float(q[1]), float(q[2])]
+
     spec = mujoco.MjSpec.from_file(str(G1_SCENE))
     torso = spec.body("torso_link")
     cam = torso.add_camera()
     cam.name = "head"
     cam.pos = HEAD_CAM_POS
     cam.quat = HEAD_CAM_QUAT
+
+    # Chase cam — position tracks the torso COM in world frame (mode
+    # TRACKCOM); fixed quat points forward+down so the robot stays in
+    # view as it walks. Added to worldbody so cam orientation is stable
+    # regardless of body pitch/roll (vs. attaching to torso_link which
+    # would tilt with the robot).
+    world = spec.worldbody
+    chase = world.add_camera()
+    chase.name = "chase"
+    chase.mode = mujoco.mjtCamLight.mjCAMLIGHT_TRACKCOM
+    chase.targetbody = "torso_link"
+    chase.pos = [-2.5, 0.0, 1.5]
+    chase.quat = _look_at_quat(chase.pos, [0.0, 0.0, 0.6])
+
+    side = world.add_camera()
+    side.name = "side"
+    side.mode = mujoco.mjtCamLight.mjCAMLIGHT_TRACKCOM
+    side.targetbody = "torso_link"
+    side.pos = [0.0, -2.5, 1.0]
+    side.quat = _look_at_quat(side.pos, [0.0, 0.0, 0.6])
+
     mj_model = spec.compile()
     mj_data = mujoco.MjData(mj_model)
-    cam_id = mj_model.camera("head").id
+    cam_ids = {
+        "head": mj_model.camera("head").id,
+        "chase": mj_model.camera("chase").id,
+        "side": mj_model.camera("side").id,
+    }
     renderer = mujoco.Renderer(mj_model, height=224, width=224)
 
     env = registry.load(ENV_NAME, config_overrides=ENV_OVERRIDES)
@@ -204,7 +248,8 @@ def build_env_and_policy(ckpt_policy: Path | None, device: str, seed: int):
         "step_fn": step_fn,
         "mj_model": mj_model,
         "mj_data": mj_data,
-        "cam_id": cam_id,
+        "cam_id": cam_ids["head"],  # back-compat: head-cam is the encoder view
+        "cam_ids": cam_ids,
         "renderer": renderer,
         "policy": policy,
     }
@@ -227,6 +272,30 @@ def render_head_cam(env_ctx: dict) -> np.ndarray:
     return env_ctx["renderer"].render().copy()  # (224, 224, 3) uint8
 
 
+def render_multi_cam(env_ctx: dict) -> np.ndarray:
+    """Render head + chase + side cameras from current sim state and
+    stack them horizontally into one frame (H, 3*W, 3) uint8. Used for
+    the demo video — NOT for the encoder/planner.
+    """
+    state = env_ctx["state"]
+    mjx_data = getattr(state, "data", None) or getattr(
+        state, "pipeline_state", None
+    )
+    mj_data = env_ctx["mj_data"]
+    mj_model = env_ctx["mj_model"]
+    mj_data.qpos[:] = np.asarray(mjx_data.qpos)
+    mj_data.qvel[:] = np.asarray(mjx_data.qvel)
+    import mujoco
+
+    mujoco.mj_forward(mj_model, mj_data)
+    renderer = env_ctx["renderer"]
+    frames = []
+    for name in ("head", "chase", "side"):
+        renderer.update_scene(mj_data, camera=env_ctx["cam_ids"][name])
+        frames.append(renderer.render().copy())
+    return np.concatenate(frames, axis=1)  # (H, 3*W, 3)
+
+
 def rollout_policy_warm_start(
     env_ctx: dict, horizon: int, rng_key
 ) -> tuple[np.ndarray, object] | tuple[None, object]:
@@ -242,12 +311,17 @@ def rollout_policy_warm_start(
     if policy is None:
         return None, rng_key
     shadow_state = env_ctx["state"]
+    pinned_cmd = env_ctx.get("pinned_cmd")
     acts: list[np.ndarray] = []
     for _ in range(horizon):
         rng_key, sub = jax.random.split(rng_key)
         action, _ = policy(shadow_state.obs, sub)
         acts.append(np.asarray(action, dtype=np.float32))
         shadow_state = env_ctx["step_fn"](shadow_state, action)
+        if pinned_cmd is not None:
+            shadow_state = shadow_state.replace(
+                info={**shadow_state.info, "command": pinned_cmd}
+            )
     return np.stack(acts, axis=0), rng_key
 
 
@@ -277,8 +351,24 @@ def load_goal_pixel(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--encoder",
+        choices=["lewm-v3", "dinov3-v4"],
+        default="lewm-v3",
+        help="Which world-model encoder to plan with. 'lewm-v3' uses "
+        "the trained-from-scratch ViT-tiny LeWM checkpoint (M4.3). "
+        "'dinov3-v4' uses the frozen DINOv3 ViT-B/16 + trainable "
+        "predictor from M4.5 JEPAv4. See plan at "
+        "~/.claude/plans/yes-we-are-in-delegated-russell.md",
+    )
     ap.add_argument("--ckpt-lewm", type=Path, default=DEFAULT_CKPT_LEWM)
     ap.add_argument("--ckpt-hl", type=Path, default=DEFAULT_CKPT_HL)
+    ap.add_argument(
+        "--ckpt-jepa-v4",
+        type=Path,
+        default=Path.home() / ".vitruvian" / "m4e_v4" / "best.pt",
+        help="Path to M4.5 JEPAv4 checkpoint (used when --encoder dinov3-v4).",
+    )
     ap.add_argument("--h5", type=Path, default=DEFAULT_H5)
     ap.add_argument(
         "--goal-source",
@@ -315,6 +405,29 @@ def main() -> None:
     ap.add_argument("--l1-noise-sigma", type=float, default=0.3)
     ap.add_argument("--l1-iterations", type=int, default=3)
     ap.add_argument(
+        "--mc-dropout-k",
+        type=int,
+        default=1,
+        help="MC-dropout ensemble size for flat MPPI. >1 enables "
+        "dropout-based variance estimation used as uncertainty cost.",
+    )
+    ap.add_argument(
+        "--beta-unc",
+        type=float,
+        default=0.0,
+        help="Weight on the uncertainty (ensemble-variance) term in the "
+        "flat MPPI cost. C = C_goal + beta_unc * Var_k(f^k). 0 disables.",
+    )
+    ap.add_argument(
+        "--vf-ckpt",
+        type=Path,
+        default=None,
+        help="Path to a value-head checkpoint trained by m4d_train_vf.py. "
+        "When provided, flat MPPI uses the VF_quasi cost "
+        "||f_ψ(pred_final) - f_ψ(goal)||² instead of terminal-MSE in the "
+        "LeWM latent space.",
+    )
+    ap.add_argument(
         "--warm-start-policy",
         action="store_true",
         help="Use the loaded PPO policy as MPPI nominal prior at each "
@@ -326,6 +439,16 @@ def main() -> None:
         type=Path,
         default=None,
         help="Optional output path — render chase-cam video of run.",
+    )
+    ap.add_argument(
+        "--vel-cmd",
+        type=str,
+        default=None,
+        help="Pin the G1JoystickFlatTerrain command vector to "
+        "'lin_vel_x,lin_vel_y,yaw_rate' (e.g. '0.5,0,0' for forward "
+        "walk). Overwrites state.info['command'] on every step, which "
+        "disables the env's own command resampling. Defaults to the "
+        "env's randomized command.",
     )
     args = ap.parse_args()
 
@@ -355,9 +478,30 @@ def main() -> None:
     _ = get_torso_xyz(env_ctx)
 
     # --- Model ---
-    model, cfg = load_high_level_model(args.ckpt_lewm, args.ckpt_hl, device)
-    step_skip = int(cfg.get("step_skip", 50))
-    backbone = model.backbone
+    if args.encoder == "lewm-v3":
+        model, cfg = load_high_level_model(args.ckpt_lewm, args.ckpt_hl, device)
+        step_skip = int(cfg.get("step_skip", 50))
+        backbone = model.backbone
+        # jepa_for_rollout is what LowLevelPlanner uses for .rollout() /
+        # .encode() calls; backbone_for_planner supplies .output_dim.
+        jepa_for_rollout = model.backbone.jepa
+        backbone_for_planner = model.backbone
+        hl_planner_source = model  # keeps HL path working for --decoder mppi
+    else:  # dinov3-v4
+        from vitruvian.hwm.jepa_v4 import load_jepa_v4_from_checkpoint
+
+        print(f"[encoder]  dinov3-v4: loading JEPAv4 from {args.ckpt_jepa_v4}")
+        jepa_v4 = load_jepa_v4_from_checkpoint(str(args.ckpt_jepa_v4), device=device)
+        step_skip = 50  # macro duration is independent of encoder
+        # jepa_v4.backbone is a DINOv3Backbone; exposes .output_dim and
+        # .encode(pixels) — same interface as LeWMBackboneAdapter for
+        # the main planning loop.
+        backbone = jepa_v4.backbone
+        jepa_for_rollout = jepa_v4
+        backbone_for_planner = jepa_v4.backbone
+        hl_planner_source = None
+        model = None  # HL-based decoders require v3; they'll error below if used
+        cfg = {"step_skip": step_skip, "encoder": "dinov3-v4"}
 
     # --- Goal ---
     goal_pix = load_goal_pixel(
@@ -371,18 +515,25 @@ def main() -> None:
     )
 
     # --- Planner ---
-    hl_planner = HighLevelPlanner(
-        hl_model=model,
-        goal_emb=goal_emb,
-        horizon=args.horizon_macros,
-        num_samples=args.num_samples,
-        noise_sigma=args.noise_sigma,
-        lambda_=args.lambda_,
-        device=device,
-    )
+    # HL planner is only meaningful on the v3 path (which trained an HL head).
+    hl_planner = None
+    if args.encoder == "lewm-v3":
+        hl_planner = HighLevelPlanner(
+            hl_model=model,
+            goal_emb=goal_emb,
+            horizon=args.horizon_macros,
+            num_samples=args.num_samples,
+            noise_sigma=args.noise_sigma,
+            lambda_=args.lambda_,
+            device=device,
+        )
 
     flat_planner = None
     if args.decoder == "nn":
+        if args.encoder != "lewm-v3":
+            raise RuntimeError(
+                "--decoder nn requires --encoder lewm-v3 (uses HL macro encoder)."
+            )
         nn_ret = MacroNNRetriever(
             h5_path=args.h5,
             action_encoder=model.action_encoder,
@@ -393,9 +544,38 @@ def main() -> None:
     elif args.decoder == "flat":
         nn_ret = None
         hier_planner = None
+        # Optional VF_quasi value head.
+        value_head = None
+        if args.vf_ckpt is not None:
+            sys.path.insert(0, str(ROOT / "scripts"))
+            from m4d_train_vf import ValueHead  # type: ignore
+
+            vf_ckpt = torch.load(args.vf_ckpt, map_location=device, weights_only=False)
+            value_head = ValueHead(
+                emb_dim=int(vf_ckpt["emb_dim"]),
+                hidden=int(vf_ckpt["hidden"]),
+                out_dim=int(vf_ckpt["out_dim"]),
+            ).to(device)
+            value_head.load_state_dict(vf_ckpt["vf_state"])
+            value_head.eval()
+            for p in value_head.parameters():
+                p.requires_grad_(False)
+            # Guard: value head emb_dim must match the encoder's output dim
+            # or the value-function cost will silently mis-rank candidates.
+            if int(vf_ckpt["emb_dim"]) != backbone_for_planner.output_dim:
+                raise RuntimeError(
+                    f"--vf-ckpt emb_dim {vf_ckpt['emb_dim']} does not match "
+                    f"encoder output_dim {backbone_for_planner.output_dim}. "
+                    f"Re-train VF against the correct encoder."
+                )
+            print(
+                f"[vf]   loaded value head from {args.vf_ckpt}  "
+                f"(emb={vf_ckpt['emb_dim']} -> {vf_ckpt['out_dim']})"
+            )
+
         flat_planner = LowLevelPlanner(
-            lewm_jepa=model.backbone.jepa,
-            backbone=model.backbone,
+            lewm_jepa=jepa_for_rollout,
+            backbone=backbone_for_planner,
             subgoal_emb=goal_emb,
             horizon=step_skip,
             num_samples=args.l1_num_samples,
@@ -403,18 +583,30 @@ def main() -> None:
             iterations=args.l1_iterations,
             history_size=3,
             device=device,
+            mc_dropout_k=args.mc_dropout_k,
+            beta_unc=args.beta_unc,
+            value_head=value_head,
+        )
+        unc_str = (
+            f" + β·unc (K_mc={args.mc_dropout_k}, β={args.beta_unc})"
+            if args.mc_dropout_k > 1 and args.beta_unc > 0
+            else ""
         )
         print(
             f"[decoder=flat] MPPI-on-primitives: {args.l1_num_samples} "
             f"samples × {args.l1_iterations} iters × {step_skip}-step "
-            f"horizon (HL bypassed)"
+            f"horizon{unc_str} (HL bypassed, encoder={args.encoder})"
         )
     else:  # mppi — two-level
+        if args.encoder != "lewm-v3":
+            raise RuntimeError(
+                "--decoder mppi (two-level) requires --encoder lewm-v3."
+            )
         nn_ret = None
         hier_planner = HierarchicalPlanner(
             hl_planner=hl_planner,
-            lewm_jepa=model.backbone.jepa,
-            backbone=model.backbone,
+            lewm_jepa=jepa_for_rollout,
+            backbone=backbone_for_planner,
             horizon_primitives=step_skip,
             num_samples_l1=args.l1_num_samples,
             noise_sigma_l1=args.l1_noise_sigma,
@@ -430,6 +622,23 @@ def main() -> None:
     # --- Env was already built above; just re-bind locals here. ---
     env = env_ctx["env"]
     step_fn = env_ctx["step_fn"]
+
+    # Parse optional pinned velocity command and splat it onto the
+    # state on every primitive step below.
+    pinned_cmd = None
+    if args.vel_cmd is not None:
+        pinned_cmd = jnp.asarray(
+            [float(x) for x in args.vel_cmd.split(",")], dtype=jnp.float32
+        )
+        if pinned_cmd.shape != (3,):
+            raise ValueError(
+                f"--vel-cmd expects 3 comma-separated floats; got {args.vel_cmd!r}"
+            )
+        env_ctx["state"] = env_ctx["state"].replace(
+            info={**env_ctx["state"].info, "command": pinned_cmd}
+        )
+        env_ctx["pinned_cmd"] = pinned_cmd
+        print(f"[cmd]  pinned command = {list(pinned_cmd)}")
 
     # --- Optional video ---
     video_frames: list[np.ndarray] = []
@@ -462,6 +671,7 @@ def main() -> None:
                 curr_emb, goal_emb, dim=-1
             )
         )
+        row_extra_unc = None
         if args.decoder == "nn":
             plan = hl_planner.plan(curr_emb, shift_nominal=macro_idx > 0)
             macro_latent = plan[0]
@@ -485,6 +695,11 @@ def main() -> None:
             primitives = U  # (horizon, action_dim)
             macro_latent = torch.zeros(1, device=device)  # not used
             l1_cost = flat_planner.best_cost
+            row_extra_unc = (
+                flat_planner.best_c_unc
+                if args.mc_dropout_k > 1
+                else None
+            )
         else:
             ph = torch.stack(pixel_hist, dim=0)
             ah = (
@@ -509,12 +724,19 @@ def main() -> None:
             macro_latent = diag["macro_plan"][0].to(device)
             l1_cost = diag["l1_best_cost"]
 
-        # 3. Step env with primitives.
+        # 3. Step env with primitives. Render multi-cam at every step
+        # when --render-mp4 is set, so the demo video runs at sim rate.
         prim_np = primitives.detach().cpu().numpy()
         for p in prim_np:
             action_jax = jnp.asarray(p, dtype=jnp.float32)
             env_ctx["state"] = step_fn(env_ctx["state"], action_jax)
+            if pinned_cmd is not None:
+                env_ctx["state"] = env_ctx["state"].replace(
+                    info={**env_ctx["state"].info, "command": pinned_cmd}
+                )
             action_hist.append(p.copy())
+            if args.render_mp4 is not None:
+                video_frames.append(render_multi_cam(env_ctx))
         if len(action_hist) > HIST_SIZE:
             action_hist = action_hist[-HIST_SIZE:]
 
@@ -532,10 +754,13 @@ def main() -> None:
         }
         log_rows.append(row)
         l1_str = f"  l1={l1_cost:7.2f}" if l1_cost is not None else ""
+        unc_str = (
+            f"  unc={row_extra_unc:7.2f}" if row_extra_unc is not None else ""
+        )
         print(
             f"  macro {macro_idx:>2}  cost={cost:9.3f}  "
             f"cos={cos:+.3f}  z={z:.3f} m  dxy={dxy:.3f} m  "
-            f"|l|={row['macro_latent_norm']:.2f}{l1_str}"
+            f"|l|={row['macro_latent_norm']:.2f}{l1_str}{unc_str}"
         )
 
         # 5. Early-termination check — if G1 fell, stop.
@@ -543,8 +768,8 @@ def main() -> None:
             print(f"  [terminate] torso z < 0.3 m at macro {macro_idx} — fell.")
             break
 
-        if args.render_mp4 is not None:
-            video_frames.append(pix)
+        # (multi-cam frames are appended inside the primitive step loop
+        # above so the demo video runs at sim rate rather than 1 fps.)
 
     wall = time.perf_counter() - t0
     print(f"\n--- Summary ({wall:.1f}s) ---")
@@ -569,7 +794,7 @@ def main() -> None:
             import mediapy
 
             args.render_mp4.parent.mkdir(parents=True, exist_ok=True)
-            mediapy.write_video(str(args.render_mp4), video_frames, fps=1)
+            mediapy.write_video(str(args.render_mp4), video_frames, fps=50)
             print(f"[video] wrote {args.render_mp4}")
         except Exception as e:
             print(f"[video] FAILED: {type(e).__name__}: {e}")
