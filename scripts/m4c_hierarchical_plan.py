@@ -353,13 +353,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--encoder",
-        choices=["lewm-v3", "dinov3-v4"],
+        choices=["lewm-v3", "dinov3-v4", "dinov3-v5"],
         default="lewm-v3",
         help="Which world-model encoder to plan with. 'lewm-v3' uses "
         "the trained-from-scratch ViT-tiny LeWM checkpoint (M4.3). "
-        "'dinov3-v4' uses the frozen DINOv3 ViT-B/16 + trainable "
-        "predictor from M4.5 JEPAv4. See plan at "
-        "~/.claude/plans/yes-we-are-in-delegated-russell.md",
+        "'dinov3-v4' uses the frozen DINOv3 ViT-B/16 + CLS-based v4 "
+        "predictor (M4.5). 'dinov3-v5' uses the frozen DINOv3 ViT-B/16 "
+        "+ patch (7×7) JEPAv5 predictor (M4.6).",
     )
     ap.add_argument("--ckpt-lewm", type=Path, default=DEFAULT_CKPT_LEWM)
     ap.add_argument("--ckpt-hl", type=Path, default=DEFAULT_CKPT_HL)
@@ -368,6 +368,12 @@ def main() -> None:
         type=Path,
         default=Path.home() / ".vitruvian" / "m4e_v4" / "best.pt",
         help="Path to M4.5 JEPAv4 checkpoint (used when --encoder dinov3-v4).",
+    )
+    ap.add_argument(
+        "--ckpt-jepa-v5",
+        type=Path,
+        default=Path.home() / ".vitruvian" / "m4f_v5" / "best.pt",
+        help="Path to M4.6 JEPAv5 checkpoint (used when --encoder dinov3-v5).",
     )
     ap.add_argument("--h5", type=Path, default=DEFAULT_H5)
     ap.add_argument(
@@ -441,6 +447,11 @@ def main() -> None:
         help="Optional output path — render chase-cam video of run.",
     )
     ap.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile on the predictor (useful for debug).",
+    )
+    ap.add_argument(
         "--vel-cmd",
         type=str,
         default=None,
@@ -487,21 +498,56 @@ def main() -> None:
         jepa_for_rollout = model.backbone.jepa
         backbone_for_planner = model.backbone
         hl_planner_source = model  # keeps HL path working for --decoder mppi
-    else:  # dinov3-v4
+    elif args.encoder == "dinov3-v4":
         from vitruvian.hwm.jepa_v4 import load_jepa_v4_from_checkpoint
 
         print(f"[encoder]  dinov3-v4: loading JEPAv4 from {args.ckpt_jepa_v4}")
         jepa_v4 = load_jepa_v4_from_checkpoint(str(args.ckpt_jepa_v4), device=device)
-        step_skip = 50  # macro duration is independent of encoder
-        # jepa_v4.backbone is a DINOv3Backbone; exposes .output_dim and
-        # .encode(pixels) — same interface as LeWMBackboneAdapter for
-        # the main planning loop.
+        step_skip = 50
         backbone = jepa_v4.backbone
         jepa_for_rollout = jepa_v4
         backbone_for_planner = jepa_v4.backbone
         hl_planner_source = None
-        model = None  # HL-based decoders require v3; they'll error below if used
+        model = None
         cfg = {"step_skip": step_skip, "encoder": "dinov3-v4"}
+    else:  # dinov3-v5
+        from vitruvian.hwm.jepa_v5 import (
+            JEPAv5PlannerBackbone,
+            load_jepa_v5_from_checkpoint,
+        )
+
+        print(f"[encoder]  dinov3-v5: loading JEPAv5 from {args.ckpt_jepa_v5}")
+        jepa_v5 = load_jepa_v5_from_checkpoint(str(args.ckpt_jepa_v5), device=device)
+        step_skip = 50
+        # The v5 "planner backbone" is DINOv3-patches + trainable
+        # patch_proj — exposes the projected (B, T, 49, 256) latent that
+        # the predictor trained against. Without the projection the
+        # subgoal would live in 768-D and the predictor output in 256-D
+        # — shapes would disagree.
+        v5_planner_bb = JEPAv5PlannerBackbone(jepa_v5).to(device)
+        backbone = v5_planner_bb
+        jepa_for_rollout = jepa_v5
+        backbone_for_planner = v5_planner_bb
+        hl_planner_source = None
+        model = None
+        cfg = {"step_skip": step_skip, "encoder": "dinov3-v5"}
+
+    # Plan-time: compile the predictor for faster MPPI rollouts.
+    # Encoder is NOT compiled — the new EncoderHistory makes encode
+    # cheap (once per macro boundary); the predictor is the hot path
+    # (K × iterations × H_steps forwards per macro).
+    if not getattr(args, "no_compile", False):
+        try:
+            from vitruvian.hwm.compile_utils import compile_model
+
+            jepa_for_rollout.predictor = compile_model(
+                jepa_for_rollout.predictor,
+                mode="reduce-overhead",
+                dynamic=True,
+            )
+            print(f"[compile] jepa.predictor wrapped with torch.compile")
+        except Exception as e:  # pragma: no cover — debug fallback
+            print(f"[compile] skipped ({type(e).__name__}: {e})")
 
     # --- Goal ---
     goal_pix = load_goal_pixel(
@@ -646,31 +692,43 @@ def main() -> None:
     # --- Run ---
     log_rows: list[dict] = []
     start_xyz = get_torso_xyz(env_ctx)
-    # Rolling history for L1 MPPI (history_size most recent frames + actions).
+    # Rolling history for L1 MPPI. EncoderHistory encodes each pushed
+    # frame EXACTLY ONCE — replacing the M4.6 pattern that let the
+    # planner re-encode the full 3-frame history every MPPI iteration
+    # (2/3 redundant).
+    from vitruvian.hwm.encoder_history import EncoderHistory  # local import
+
     HIST_SIZE = 3
-    pixel_hist: list[torch.Tensor] = []
+    history = EncoderHistory(size=HIST_SIZE, encoder=backbone.encode)
     action_hist: list[np.ndarray] = []
     t0 = time.perf_counter()
     for macro_idx in range(args.total_macros):
-        # 1. Capture current head-cam frame → encode.
+        # 1. Capture current head-cam frame → encode once via history.
         pix = render_head_cam(env_ctx)  # (224, 224, 3) uint8
-        pix_t = torch.from_numpy(pix).permute(2, 0, 1).float().unsqueeze(
-            0
-        ).unsqueeze(0).to(device) / 255.0
-        curr_emb = backbone.encode(pix_t).squeeze(0).squeeze(0)
-
-        # Update pixel history with the latest frame.
-        pixel_hist.append(pix_t[0, 0])
-        if len(pixel_hist) > HIST_SIZE:
-            pixel_hist = pixel_hist[-HIST_SIZE:]
+        pix_chw = (
+            torch.from_numpy(pix).permute(2, 0, 1).float().to(device) / 255.0
+        )
+        curr_emb = history.push(pix_chw)  # only-new-frame encode
 
         # 2. Plan macros + decode to primitives.
+        # Shape-agnostic cost/cos aggregates: works for CLS (D,) and patch
+        # (N, D) subgoal shapes alike.
         cost = float(((curr_emb - goal_emb) ** 2).sum())
-        cos = float(
-            torch.nn.functional.cosine_similarity(
-                curr_emb, goal_emb, dim=-1
+        if curr_emb.ndim == 1:
+            cos = float(
+                torch.nn.functional.cosine_similarity(
+                    curr_emb.unsqueeze(0),
+                    goal_emb.unsqueeze(0),
+                    dim=-1,
+                )
             )
-        )
+        else:
+            # Patch-latent: per-patch cosine, mean over patches.
+            cos = float(
+                torch.nn.functional.cosine_similarity(
+                    curr_emb, goal_emb, dim=-1
+                ).mean()
+            )
         row_extra_unc = None
         if args.decoder == "nn":
             plan = hl_planner.plan(curr_emb, shift_nominal=macro_idx > 0)
@@ -678,7 +736,7 @@ def main() -> None:
             primitives = nn_ret.retrieve_first(macro_latent)
             l1_cost = None
         elif args.decoder == "flat":
-            ph = torch.stack(pixel_hist, dim=0)
+            encoded_window = history.latest_window()  # (HS, *emb_shape)
             ah = (
                 torch.from_numpy(np.stack(action_hist, axis=0)).to(device)
                 if action_hist
@@ -691,7 +749,12 @@ def main() -> None:
                 )
                 if warm_U_np is not None:
                     warm_start_U_t = torch.from_numpy(warm_U_np).to(device)
-            U = flat_planner.plan(ph, ah, warm_start_U=warm_start_U_t)
+            U = flat_planner.plan(
+                pixel_history=None,
+                action_history=ah,
+                warm_start_U=warm_start_U_t,
+                encoded_history=encoded_window,
+            )
             primitives = U  # (horizon, action_dim)
             macro_latent = torch.zeros(1, device=device)  # not used
             l1_cost = flat_planner.best_cost
@@ -701,7 +764,8 @@ def main() -> None:
                 else None
             )
         else:
-            ph = torch.stack(pixel_hist, dim=0)
+            # Hierarchical MPPI keeps the raw-pixel path (unchanged API).
+            ph = history.raw_window()  # (HS, 3, H, W)
             ah = (
                 torch.from_numpy(np.stack(action_hist, axis=0)).to(device)
                 if action_hist

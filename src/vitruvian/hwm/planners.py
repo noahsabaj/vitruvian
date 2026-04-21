@@ -249,7 +249,9 @@ class LowLevelPlanner(nn.Module):
                 f"subgoal_emb last dim {subgoal_emb.shape[-1]} != "
                 f"backbone output dim {backbone.output_dim}"
             )
-        self.subgoal_emb = subgoal_emb.detach().to(device).view(-1)
+        # Preserve full shape — (D,) for CLS encoders, (N, D) for patch
+        # encoders. Cost broadcasts pred_final (K, ...) − subgoal (...).
+        self.subgoal_emb = subgoal_emb.detach().to(device)
 
         # Warm-started nominal trajectory for receding-horizon reuse.
         self.U: torch.Tensor | None = None
@@ -259,7 +261,8 @@ class LowLevelPlanner(nn.Module):
         self._plan_call_idx: int = 0
 
     def set_subgoal(self, subgoal_emb: torch.Tensor) -> None:
-        self.subgoal_emb = subgoal_emb.detach().to(self.device).view(-1)
+        # Preserve full shape; planner cost broadcasts.
+        self.subgoal_emb = subgoal_emb.detach().to(self.device)
 
     def reset(self) -> None:
         self.U = None
@@ -267,49 +270,93 @@ class LowLevelPlanner(nn.Module):
     @torch.no_grad()
     def plan(
         self,
-        pixel_history: torch.Tensor,
+        pixel_history: torch.Tensor | None,
         action_history: torch.Tensor,
         warm_start_U: torch.Tensor | None = None,
+        *,
+        encoded_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Plan ``horizon`` primitive actions via CEM-MPPI against subgoal.
 
+        Supports two input modes:
+
+        - **Pixel mode (legacy)**: pass ``pixel_history`` of shape
+          ``(H_hist, 3, H, W)`` — the planner will call
+          ``jepa.rollout`` with pixels, which internally re-encodes on
+          every MPPI iteration (2/3 of those encoder forwards are
+          redundant since only the newest frame is new).
+
+        - **Pre-encoded mode (M4.7)**: pass ``encoded_history`` of shape
+          ``(H_hist, *emb_shape)`` — the planner broadcasts it across
+          MPPI candidates and hands ``jepa.rollout`` a pre-populated
+          ``"emb"`` field, skipping all per-iteration encoder calls.
+          The caller (typically ``EncoderHistory.latest_window()``) is
+          responsible for encoding each frame exactly once at push time.
+
+        Exactly one of ``pixel_history`` or ``encoded_history`` must be
+        provided.
+
         Args:
-            pixel_history: (H_hist, 3, H, W) last-``history_size`` head-cam
-                frames in [0, 1] float or uint8. If fewer than
-                ``history_size`` provided, we pad by repeating the earliest.
-            action_history: (H_hist, action_dim) matching primitive actions.
-                Zero-pad if absent.
+            pixel_history: (H_hist, 3, H, W) head-cam frames in [0, 1]
+                float or uint8. Pad-by-repeat if fewer than H_hist frames.
+            action_history: (H_hist, action_dim) matching primitive
+                actions. Zero-pad if absent.
             warm_start_U: (horizon, action_dim) optional nominal plan to
                 initialize from — e.g. an expert PPO policy rolled out
-                from the current env state. When provided, overrides both
-                zero-init and the shifted self.U, because an expert prior
-                in the current state is more informative than yesterday's
-                refined plan. This is the PLDM "expert-prior nominal"
+                from the current env state. PLDM "expert-prior nominal"
                 trick — puts MPPI's Gaussian sample cloud inside the
                 world-model training distribution.
+            encoded_history: (H_hist, *emb_shape) pre-encoded frame
+                history. Mutually exclusive with ``pixel_history``.
         Returns:
             U: (horizon, action_dim) planned primitive actions.
         """
+        if (pixel_history is None) == (encoded_history is None):
+            raise ValueError(
+                "plan() requires exactly one of pixel_history or "
+                "encoded_history; got "
+                f"{'both' if pixel_history is not None else 'neither'}."
+            )
         device = self.device
         HS = self.history_size
         H = self.horizon
         K = self.num_samples
         A = self.action_dim
 
-        # Left-pad the history to exactly HS frames.
-        ph = pixel_history.to(device)
-        if ph.dtype == torch.uint8:
-            ph = ph.float() / 255.0
         ah = action_history.to(device).float()
-        if ph.shape[0] < HS:
-            pad_n = HS - ph.shape[0]
-            ph = torch.cat([ph[:1].expand(pad_n, -1, -1, -1), ph], dim=0)
-            ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
-        ph = ph[-HS:]
-        ah = ah[-HS:]
 
-        # Shape everything to (B=1, S=K, T, ...) expected by rollout.
-        pixels_KS = ph.unsqueeze(0).unsqueeze(0).expand(1, K, -1, -1, -1, -1)
+        # Build the per-iter rollout inputs. Two modes produce either
+        # ``pixels_KS`` (pixel mode) or ``emb_KS`` (pre-encoded mode)
+        # with identical (B=1, S=K, H_hist, ...) leading shape.
+        pixels_KS: torch.Tensor | None = None
+        emb_KS: torch.Tensor | None = None
+        if encoded_history is not None:
+            eh = encoded_history.to(device).float()
+            if eh.shape[0] < HS:
+                pad_n = HS - eh.shape[0]
+                pad_tile = eh[:1].expand((pad_n,) + tuple(eh.shape[1:]))
+                eh = torch.cat([pad_tile, eh], dim=0)
+                ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
+            eh = eh[-HS:]
+            # (HS, *emb_shape) → (1, K, HS, *emb_shape)
+            emb_KS = eh.unsqueeze(0).unsqueeze(0).expand(
+                (1, K) + tuple(eh.shape)
+            ).contiguous()
+        else:
+            assert pixel_history is not None
+            ph = pixel_history.to(device)
+            if ph.dtype == torch.uint8:
+                ph = ph.float() / 255.0
+            if ph.shape[0] < HS:
+                pad_n = HS - ph.shape[0]
+                ph = torch.cat([ph[:1].expand(pad_n, -1, -1, -1), ph], dim=0)
+                ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
+            ph = ph[-HS:]
+            pixels_KS = ph.unsqueeze(0).unsqueeze(0).expand(
+                1, K, -1, -1, -1, -1
+            )
+
+        ah = ah[-HS:]
         hist_acts_KS = ah.unsqueeze(0).unsqueeze(0).expand(1, K, -1, -1)
 
         # Initialize nominal plan. Priority: warm-start > shifted > zeros.
@@ -351,20 +398,36 @@ class LowLevelPlanner(nn.Module):
             # this identical to the K=1 baseline preserves the walking
             # behavior when β=0.
             _set_dropout(False)
-            info = {"pixels": pixels_KS.clone()}
+            if emb_KS is not None:
+                # Pre-encoded: jepa.rollout will skip the encode() call.
+                info = {"emb": emb_KS.clone()}
+            else:
+                assert pixels_KS is not None
+                info = {"pixels": pixels_KS.clone()}
             out = self.jepa.rollout(info, action_seq, history_size=HS)
             pred_emb = out["predicted_emb"]  # (B, S, T_all, D)
-            pred_final_det = pred_emb[0, :, -1, :]  # (K, D)
+            # pred_emb shape: (B=1, S=K, T_total, *latent_shape)
+            # For CLS latent this is (1, K, T, D); for patch latent
+            # (v5) it's (1, K, T, N_patches, D). We take the terminal
+            # timestep across K and keep all trailing latent dims.
+            pred_final_det = pred_emb[0, :, -1]  # (K, *latent_shape)
             if self.value_head is not None:
+                if pred_final_det.ndim != 2:
+                    raise RuntimeError(
+                        f"value_head path expects (K, D) pred_final; got "
+                        f"{tuple(pred_final_det.shape)}. Patch-latent VF "
+                        f"head is not implemented in M4.6 first pass."
+                    )
                 # VF_quasi cost: squared distance in the learned
                 # value-embedding space. Approximates -V*(pred_final, goal).
                 f_pred = self.value_head.f(pred_final_det)  # (K, d_v)
                 f_goal = self.value_head.f(self.subgoal_emb.unsqueeze(0))
                 c_goal = ((f_pred - f_goal) ** 2).sum(dim=-1)
             else:
-                c_goal = (
-                    (pred_final_det - self.subgoal_emb) ** 2
-                ).sum(dim=-1)
+                # Shape-agnostic squared-error cost: works for both
+                # CLS (K, D) and patch (K, N_patches, D).
+                diff = pred_final_det - self.subgoal_emb
+                c_goal = diff.pow(2).flatten(1).sum(dim=-1)
 
             # 2. MC rollouts (dropout on) → variance = uncertainty cost.
             # Only evaluated if the caller enabled MC. Snapshot+restore
@@ -383,7 +446,11 @@ class LowLevelPlanner(nn.Module):
                 _set_dropout(True)
                 pred_finals = []
                 for _m in range(M):
-                    info = {"pixels": pixels_KS.clone()}
+                    if emb_KS is not None:
+                        info = {"emb": emb_KS.clone()}
+                    else:
+                        assert pixels_KS is not None
+                        info = {"pixels": pixels_KS.clone()}
                     out = self.jepa.rollout(info, action_seq, history_size=HS)
                     pred_emb = out["predicted_emb"]
                     pred_finals.append(pred_emb[0, :, -1, :])
