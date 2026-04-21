@@ -178,25 +178,37 @@ class JEPAv4(nn.Module):
     ) -> dict:
         """Autoregressive rollout for MPPI candidate scoring.
 
-        pixels: (B, S, T_hist, 3, H, W).
+        Accepts either pre-encoded ``"emb"`` of shape
+        ``(B, S, T_hist, D)`` or raw ``"pixels"`` of shape
+        ``(B, S, T_hist, 3, H, W)`` in ``info``. Pre-encoded skips the
+        DINOv3 forward at plan time (M4.7 win).
+
         action_sequence: (B, S, T, action_dim*frameskip) — hist + future.
 
-        Mirrors the LeWM JEPA.rollout signature/semantics exactly so
+        Mirrors the LeWM JEPA.rollout signature/semantics so
         LowLevelPlanner doesn't care which backbone is behind it.
         """
-        assert "pixels" in info, "pixels not in info_dict"
-        H = info["pixels"].size(2)
+        if "emb" in info:
+            emb_init = info["emb"]
+            H = emb_init.size(2)
+        else:
+            assert "pixels" in info, (
+                "rollout() needs either info['emb'] or info['pixels']"
+            )
+            H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
         info["action"] = act_0
         n_steps = T - H
 
-        # Encode the initial history window. info values are (B, S, ...);
-        # pick the first sample slice along S for encoding.
-        _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
-        _init = self.encode(_init)
-        emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
-        _init = {k: _detach_clone(v) for k, v in _init.items()}
+        if "emb" in info:
+            emb = info["emb"] = emb_init  # (B, S, H, D)
+        else:
+            # Encode the initial history window.
+            _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+            _init = self.encode(_init)
+            emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+            _init = {k: _detach_clone(v) for k, v in _init.items()}
 
         emb = rearrange(emb, "b s ... -> (b s) ...").clone()
         act = rearrange(act_0, "b s ... -> (b s) ...")

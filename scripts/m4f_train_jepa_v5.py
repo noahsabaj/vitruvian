@@ -1,20 +1,19 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 The Vitruvian Authors
-"""M4.5 — train JEPAv4 (frozen DINOv3 + trainable proprio + ARPredictor)
-on the diverse G1 expert dataset.
+"""M4.6 — train JEPAv5 (frozen DINOv3 7×7 patches + trainable
+projection + proprio MLP + PatchARPredictor).
 
-Pipeline:
-  1. Load frozen DINOv3 ViT-B/16. Precompute the 768-D CLS embedding
-     for every frame in the HDF5 once → cache as torch tensor file.
-  2. Train predictor + proprio encoder + action encoder on the cached
-     embeddings with 1-step TF MSE + k-step rollout MSE up to
-     num_preds=6, following Terver et al. (arXiv:2512.24497).
+Fork of ``m4e_train_jepa_v4.py`` with two changes:
 
-The DINOv3 forward is NEVER called during training itself — only once
-during precompute. Training step is pure predictor forward/backward
-plus a small proprio MLP, so 3 epochs over 270k transitions fits in
-~1-2h even on an 8 GB GPU.
+- **Patch precompute cache** stores ``(N, 49, 768)`` fp16 — ~20 GB for
+  267k frames — instead of v4's ``(N, 768)`` fp32.
+- **Loss is per-patch L2 MSE + k-step patch rollout MSE.** The training
+  objective structure mirrors Terver et al. Fig 3b and LeWM v3
+  (``num_preds=6`` supervision).
+
+Trainable modules: `patch_proj` (768→256), `proprio_encoder`,
+`action_encoder`, `predictor`. DINOv3 backbone stays frozen.
 """
 
 from __future__ import annotations
@@ -37,40 +36,53 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "external" / "le-wm"))
 
-from vitruvian.hwm.backbone_dinov3 import DEFAULT_DINOV3_ID, DINOv3Backbone  # noqa: E402
+from vitruvian.hwm.backbone_dinov3_patches import (  # noqa: E402
+    DEFAULT_DINOV3_ID,
+    DINOv3PatchBackbone,
+)
 from vitruvian.hwm.cache import CacheKey, EmbeddingCache  # noqa: E402
 from vitruvian.hwm.compile_utils import bf16_autocast, compile_model  # noqa: E402
-from vitruvian.hwm.jepa_v4 import JEPAv4  # noqa: E402
+from vitruvian.hwm.jepa_v5 import JEPAv5  # noqa: E402
 
 
 # --------------------------------------------------------------------------
-# Precompute cache: DINOv3 CLS embeddings for every frame
+# Patch precompute cache — uses M4.7 EmbeddingCache (mmap load on HIT).
 # --------------------------------------------------------------------------
 
 
-def _build_cls_compute_fn(
+def _build_patch_compute_fn(
     h5_path: Path,
     model_id: str,
+    spatial_stride: int,
     batch_size: int,
     device: str,
     dtype: torch.dtype = torch.float16,
 ):
-    """Factory for the callback ``EmbeddingCache.from_precompute`` runs
-    on MISS. Encodes the full HDF5 CLS under BF16 autocast + compiled
-    DINOv3 — ~3× faster than M4.6.
+    """Factory for the compute callback ``EmbeddingCache.from_precompute``
+    invokes on MISS. Encodes the full HDF5 under BF16 autocast with a
+    compiled DINOv3 forward — ~3× faster than the M4.6 path.
     """
 
     def _compute() -> tuple[torch.Tensor, dict]:
-        backbone = DINOv3Backbone(model_id=model_id, device=device, dtype=dtype)
+        backbone = DINOv3PatchBackbone(
+            model_id=model_id,
+            device=device,
+            dtype=dtype,
+            spatial_stride=spatial_stride,
+        )
         backbone.eval()
+        # Compile the underlying DINOv3 ViT so the 267k-frame encode pass
+        # hits fused kernels (M4.7 speedup #7).
         backbone.dinov3 = compile_model(backbone.dinov3, mode="reduce-overhead")
+        n_patches = backbone.n_patches
+        patch_dim = backbone.output_dim
 
         with h5py.File(h5_path, "r") as f:
             pixels_ds = f["pixels"]
             n_total = int(pixels_ds.shape[0])
-            out = torch.empty(n_total, backbone.output_dim, dtype=torch.float32)
-            t0 = time.perf_counter()
+            out = torch.empty(n_total, n_patches, patch_dim, dtype=torch.float16)
             cursor = 0
+            t0 = time.perf_counter()
             with torch.no_grad(), bf16_autocast():
                 while cursor < n_total:
                     end = min(cursor + batch_size, n_total)
@@ -82,8 +94,8 @@ def _build_cls_compute_fn(
                         .unsqueeze(1)
                         .to(device)
                     )
-                    emb = backbone.encode(batch).squeeze(1).float().cpu()
-                    out[cursor:end] = emb
+                    emb = backbone.encode(batch).squeeze(1)
+                    out[cursor:end] = emb.to(torch.float16).cpu()
                     cursor = end
                     if cursor % (batch_size * 100) == 0 or cursor == n_total:
                         elapsed = time.perf_counter() - t0
@@ -95,9 +107,12 @@ def _build_cls_compute_fn(
         metadata = {
             "h5_path": str(h5_path),
             "model_id": model_id,
+            "spatial_stride": spatial_stride,
             "n_total": n_total,
-            "dim": int(backbone.output_dim),
+            "n_patches": int(n_patches),
+            "patch_dim": int(patch_dim),
         }
+        # Release DINOv3 VRAM before training starts.
         del backbone
         torch.cuda.empty_cache()
         return out, metadata
@@ -105,24 +120,33 @@ def _build_cls_compute_fn(
     return _compute
 
 
-def precompute_embeddings(
+def precompute_patch_embeddings(
     h5_path: Path,
     cache_dir: Path,
     *,
     model_id: str = DEFAULT_DINOV3_ID,
+    spatial_stride: int = 2,
     batch_size: int = 256,
     device: str = "cuda",
 ) -> EmbeddingCache:
-    """Obtain the memory-mapped CLS cache for ``h5_path``."""
+    """Obtain the memory-mapped 7×7 patch cache for ``h5_path``.
+
+    HIT returns the mmap view instantly (working-set RAM ≈ per-batch,
+    not the 20 GB total). MISS runs DINOv3 over all frames (compiled +
+    BF16) and writes the cache, then returns the mmap view.
+    """
     key = CacheKey(
-        h5_path=Path(h5_path), model_id=model_id, mode="cls"
+        h5_path=Path(h5_path),
+        model_id=model_id,
+        mode=f"patch{spatial_stride}",
     )
     return EmbeddingCache.from_precompute(
         cache_dir=Path(cache_dir),
         key=key,
-        compute_fn=_build_cls_compute_fn(
+        compute_fn=_build_patch_compute_fn(
             h5_path=Path(h5_path),
             model_id=model_id,
+            spatial_stride=spatial_stride,
             batch_size=batch_size,
             device=device,
         ),
@@ -130,30 +154,24 @@ def precompute_embeddings(
 
 
 # --------------------------------------------------------------------------
-# Dataset of (embedding, proprio, action) sequences
+# Dataset over cached patch sequences
 # --------------------------------------------------------------------------
 
 
-class G1EmbSeqDataset(Dataset):
-    """Yields dict with:
-        "emb":     (seq_len, D_emb)      float32
-        "proprio": (seq_len, D_prop)     float32
-        "action":  (seq_len, action_dim) float32
+class G1PatchSeqDataset(Dataset):
+    """Yields dict with
+        "patches":  (seq_len, N_patches, patch_dim)  fp16
+        "proprio":  (seq_len, D_prop)                fp32
+        "action":   (seq_len, action_dim)            fp32
 
-    where seq_len = history_size + num_preds. Samples are constructed
-    per-sample on-the-fly by indexing pre-built start/ep arrays; goals
-    are sampled uniformly from "any state in the same episode that's
-    seq_len frames ahead of the start".
-
-    Pixel data is NOT loaded — we use the precomputed DINOv3 embeddings.
-    Proprio and actions are cached into RAM at __init__ (~100 MB for
-    270k × 132 float32).
+    Cached patches stay fp16 in RAM to halve the footprint; cast to
+    fp32 on the GPU per-batch in the train loop.
     """
 
     def __init__(
         self,
         h5_path: Path,
-        emb_cache: torch.Tensor,
+        patch_cache: torch.Tensor,
         *,
         seq_len: int,
     ) -> None:
@@ -163,19 +181,13 @@ class G1EmbSeqDataset(Dataset):
             ep_offset = f["ep_offset"][:].astype(np.int64)
             ep_len = f["ep_len"][:].astype(np.int64)
             n_total = int(f["pixels"].shape[0])
-            # Cache all proprio + action into host RAM.
             self.proprio = torch.from_numpy(f["proprio"][:]).float()
             self.action = torch.from_numpy(f["action"][:]).float()
-        assert emb_cache.shape[0] == n_total, (
-            f"emb cache rows {emb_cache.shape[0]} != H5 rows {n_total}"
+        assert patch_cache.shape[0] == n_total, (
+            f"patch cache rows {patch_cache.shape[0]} != H5 rows {n_total}"
         )
-        self.emb = emb_cache
-        self.ep_offset = ep_offset
-        self.ep_len = ep_len
-
-        # Valid sample starts: offset o in each episode such that
-        # [o, o + seq_len) stays within that episode.
-        valid = []
+        self.patches = patch_cache
+        valid: list[int] = []
         for o, L in zip(ep_offset, ep_len):
             for t in range(int(o), int(o + L - seq_len + 1)):
                 valid.append(t)
@@ -188,54 +200,60 @@ class G1EmbSeqDataset(Dataset):
         t0 = int(self.valid_idx[idx])
         s = slice(t0, t0 + self.seq_len)
         return {
-            "emb": self.emb[s],          # (seq_len, D_emb)
-            "proprio": self.proprio[s],  # (seq_len, D_prop)
-            "action": self.action[s],    # (seq_len, action_dim)
+            "patches": self.patches[s],   # fp16 (seq_len, N, 768)
+            "proprio": self.proprio[s],
+            "action": self.action[s],
         }
 
 
 # --------------------------------------------------------------------------
-# Loss — Terver recipe: 1-step TF MSE + k-step rollout MSE
+# Loss (Terver recipe over patches)
 # --------------------------------------------------------------------------
 
 
 def compute_loss(
-    model: JEPAv4,
+    model: JEPAv5,
     batch: dict,
     *,
     history_size: int,
     num_preds: int,
     rollout_weight: float,
+    std_weight: float,
 ) -> dict:
-    """Mirror of LeWM's ``lejepa_forward`` trimmed for v4.
+    """Terver-style 1-step TF MSE + k-step rollout MSE, per-patch,
+    plus a VICReg-style variance regularizer on the projected patch
+    embeddings to prevent the trainable ``patch_proj`` from collapsing
+    to a constant (the empirical failure mode of the v5 first attempt).
 
-    batch["emb"]:     (B, T, D_emb) — precomputed DINOv3 CLS; CONST grad.
+    batch["patches"]: (B, T, N, 768) fp16 — precomputed DINOv3 patches.
     batch["proprio"]: (B, T, D_prop)
-    batch["action"]:  (B, T, A_dim) — raw actions at each frame.
-
-    We add the proprio MLP output to the (frozen) CLS to form the
-    predictor's input state. All other modules train.
+    batch["action"]:  (B, T, action_dim)
     """
-    emb_vis = batch["emb"]       # (B, T, D)
-    proprio = batch["proprio"]   # (B, T, D_prop)
-    action = batch["action"]     # (B, T, A_dim)
+    patches_raw = batch["patches"].float()   # (B, T, N, 768)
+    proprio = batch["proprio"]               # (B, T, D_prop)
+    action = batch["action"]                 # (B, T, action_dim)
 
-    # State fusion (trainable proprio branch).
-    prop_emb = model.proprio_encoder(proprio) if model.proprio_encoder is not None else 0.0
-    emb = emb_vis + prop_emb  # (B, T, D)
+    # Project + proprio fuse — matches JEPAv5.encode() output.
+    emb = model.patch_proj(patches_raw)      # (B, T, N, hidden)
+    emb = model._fuse_proprio(emb, proprio)  # (B, T, N, hidden)
 
-    # Action encoding (trainable).
-    # At frameskip=1, each frame's action is the raw 29-D vector;
-    # Embedder wants input_dim = action_dim * frameskip = 29.
-    act_emb = model.action_encoder(action)  # (B, T, D)
+    act_emb = model.action_encoder(action)   # (B, T, hidden)
+
+    # VICReg variance term on projected embeddings: each feature channel
+    # should have std >= 1 across the (batch × time × patch) axis. If
+    # patch_proj collapses to a constant, std goes to 0 → this term
+    # penalizes hard.
+    emb_flat = emb.flatten(0, 2)             # (B*T*N, hidden)
+    emb_std = emb_flat.std(dim=0, unbiased=False) + 1e-4
+    std_loss = torch.relu(1.0 - emb_std).mean()
 
     ctx_len = history_size
     n_preds = num_preds
-    ctx_emb = emb[:, :ctx_len]  # (B, ctx_len, D)
+    ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds : n_preds + ctx_len]  # (B, ctx_len, D)
+    tgt_emb = emb[:, n_preds : n_preds + ctx_len]  # (B, ctx_len, N, hidden)
 
-    pred_emb = model.predict(ctx_emb, ctx_act)  # (B, ctx_len, D)
+    pred_emb = model.predict(ctx_emb, ctx_act)    # (B, ctx_len, N, hidden)
     pred_loss = (pred_emb - tgt_emb).pow(2).mean()
 
     rollout_losses: list[torch.Tensor] = []
@@ -247,26 +265,19 @@ def compute_loss(
             )
             rolling_act = act_emb[:, k : k + ctx_len]
             pred_emb = model.predict(rolling_emb, rolling_act)
-            tgt_k = emb[:, k + ctx_len - 1 : k + ctx_len]  # (B, 1, D)
+            tgt_k = emb[:, k + ctx_len - 1 : k + ctx_len]  # (B, 1, N, hidden)
             rollout_losses.append((pred_emb[:, -1:] - tgt_k).pow(2).mean())
         rollout_loss = sum(rollout_losses) / max(1, len(rollout_losses))
     else:
         rollout_loss = torch.zeros((), device=emb.device)
 
-    total = pred_loss + rollout_weight * rollout_loss
+    total = pred_loss + rollout_weight * rollout_loss + std_weight * std_loss
     return {
         "loss": total,
         "pred_loss": pred_loss.detach(),
-        "rollout_loss": rollout_loss.detach()
-        if torch.is_tensor(rollout_loss)
-        else torch.zeros((), device=emb.device),
-        "n_rollout_steps": len(rollout_losses),
+        "rollout_loss": rollout_loss.detach() if torch.is_tensor(rollout_loss) else torch.zeros((), device=emb.device),
+        "std_loss": std_loss.detach(),
     }
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
 
 
 def cosine_lr_factor(step: int, total: int, warmup: int, peak: float, floor: float) -> float:
@@ -285,54 +296,72 @@ def main() -> None:
         type=Path,
         default=Path.home() / ".stable_worldmodel" / "g1_diverse_v1.h5",
     )
-    ap.add_argument(
-        "--dinov3-id",
-        type=str,
-        default=DEFAULT_DINOV3_ID,
-    )
+    ap.add_argument("--dinov3-id", type=str, default=DEFAULT_DINOV3_ID)
     ap.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path.home() / ".vitruvian" / "m4e_v4" / "cache",
+        default=Path.home() / ".vitruvian" / "m4f_v5" / "cache",
     )
     ap.add_argument(
         "--out-dir",
         type=Path,
-        default=Path.home() / ".vitruvian" / "m4e_v4",
+        default=Path.home() / ".vitruvian" / "m4f_v5",
     )
-    ap.add_argument("--run-name", type=str, default="jepa_v4")
+    ap.add_argument("--run-name", type=str, default="jepa_v5")
 
     # Model.
+    ap.add_argument("--spatial-stride", type=int, default=2)
     ap.add_argument("--history-size", type=int, default=3)
     ap.add_argument("--num-preds", type=int, default=6)
+    ap.add_argument("--predictor-hidden", type=int, default=256)
+    ap.add_argument("--predictor-depth", type=int, default=6)
+    ap.add_argument("--predictor-heads", type=int, default=8)
+    ap.add_argument("--predictor-mlp-dim", type=int, default=1024)
+    ap.add_argument("--predictor-dim-head", type=int, default=32)
+    ap.add_argument("--predictor-dropout", type=float, default=0.1)
+    ap.add_argument(
+        "--predictor-adaln-rank",
+        type=int,
+        default=128,
+        help="Rank of the shared AdaLN bottleneck (M4.7 refactor). "
+        "128 matches the 4060 Ti memory budget; 64 trades capacity for "
+        "extra VRAM if the patch predictor runs tight.",
+    )
     ap.add_argument("--proprio-hidden", type=int, default=256)
     ap.add_argument("--action-frameskip", type=int, default=1)
     ap.add_argument("--action-smoothed-dim", type=int, default=10)
-    ap.add_argument("--predictor-depth", type=int, default=6)
-    ap.add_argument("--predictor-heads", type=int, default=16)
-    ap.add_argument("--predictor-mlp-dim", type=int, default=3072)
-    ap.add_argument("--predictor-dropout", type=float, default=0.1)
 
     # Training.
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lr-floor", type=float, default=3e-5)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--warmup-steps", type=int, default=500)
     ap.add_argument("--rollout-weight", type=float, default=1.0)
+    ap.add_argument(
+        "--std-weight",
+        type=float,
+        default=1.0,
+        help="Weight on the VICReg variance regularizer on projected "
+        "patch embeddings. Set to 0 to disable (only if you're debugging "
+        "collapse — normal training should keep ≥ 0.1).",
+    )
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--val-frac", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
-        "--precompute-batch", type=int, default=256,
-        help="Batch size for DINOv3 precompute pass. M4.7 bumped from "
-        "128; combined with compile_model + bf16_autocast → ~3× faster.",
+        "--precompute-batch",
+        type=int,
+        default=256,
+        help="DINOv3 inference batch for the precompute pass (M4.7). "
+        "Bumped from M4.6's 64 — ~3× faster precompute when combined "
+        "with compile_model + bf16_autocast.",
     )
     ap.add_argument(
         "--no-compile",
         action="store_true",
-        help="Disable torch.compile on the predictor (useful for debug).",
+        help="Disable torch.compile on the predictor. Useful for debug.",
     )
     ap.add_argument(
         "--quick-debug",
@@ -344,41 +373,40 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"--- M4.5  JEPAv4 training (DINOv3 + proprio + ARPredictor) ---")
+    print(f"--- M4.6  JEPAv5 training (DINOv3 7×7 patches + PatchARPredictor) ---")
     print(f"device:          {device}")
     print(f"h5:              {args.h5}")
     print(f"dinov3-id:       {args.dinov3_id}")
     print(f"cache-dir:       {args.cache_dir}")
     print(f"out-dir:         {args.out_dir}")
-    print(f"history-size:    {args.history_size}  num-preds: {args.num_preds}")
-    print(f"batch-size:      {args.batch_size}  epochs: {args.epochs}  lr: {args.lr}")
+    print(f"stride:          {args.spatial_stride}  history: {args.history_size}  num-preds: {args.num_preds}")
+    print(f"batch:           {args.batch_size}  epochs: {args.epochs}  lr: {args.lr}")
     print(f"quick-debug:     {args.quick_debug}")
     print()
 
-    # ---- 1. Precompute DINOv3 encodings (memory-mapped cache) ----
-    cache = precompute_embeddings(
+    # 1. Precompute patch cache — returns memory-mapped tensor.
+    cache = precompute_patch_embeddings(
         args.h5,
         args.cache_dir,
         model_id=args.dinov3_id,
+        spatial_stride=args.spatial_stride,
         batch_size=args.precompute_batch,
         device=device,
     )
     print(f"[cache]  {cache.describe()}")
 
-    # ---- 2. Build dataset (mmap tensor view) ----
+    # 2. Dataset — dataset slices the mmap tensor; working-set RAM stays
+    # O(batch size × seq_len × N × D × 2 bytes) instead of 20 GB.
     seq_len = args.history_size + args.num_preds
-    dataset = G1EmbSeqDataset(args.h5, cache.tensor, seq_len=seq_len)
+    dataset = G1PatchSeqDataset(args.h5, cache.tensor, seq_len=seq_len)
     print(f"[data]  samples (valid starts): {len(dataset)}  seq_len: {seq_len}")
 
     if args.quick_debug:
-        # Subsample for fast plumbing check.
         from torch.utils.data import Subset
-        n_smoke = min(2000, len(dataset))
-        dataset = Subset(dataset, list(range(n_smoke)))
+        dataset = Subset(dataset, list(range(min(2000, len(dataset)))))
         print(f"[quick-debug] truncated to {len(dataset)} samples")
         args.epochs = 1
 
-    # Train/val split.
     rnd_gen = torch.Generator().manual_seed(args.seed)
     n_total = len(dataset)
     n_val = max(1, int(args.val_frac * n_total))
@@ -405,15 +433,13 @@ def main() -> None:
     )
     print(f"[data]  train: {len(train_set)}  val: {len(val_set)}")
 
-    # ---- 3. Build JEPAv4 ----
+    # 3. JEPAv5.
     proprio_dim = dataset[0]["proprio"].shape[-1] if len(dataset) > 0 else 103
     action_dim = dataset[0]["action"].shape[-1] if len(dataset) > 0 else 29
 
-    # NOTE: constructing JEPAv4 here will reload DINOv3 into VRAM —
-    # unavoidable because rollout/inference paths need it. But we're
-    # done with the precompute pass now so this is fine.
-    model = JEPAv4(
+    model = JEPAv5(
         dinov3_model_id=args.dinov3_id,
+        spatial_stride=args.spatial_stride,
         proprio_dim=int(proprio_dim),
         proprio_hidden=args.proprio_hidden,
         action_dim=int(action_dim),
@@ -423,27 +449,35 @@ def main() -> None:
         predictor_depth=args.predictor_depth,
         predictor_heads=args.predictor_heads,
         predictor_mlp_dim=args.predictor_mlp_dim,
+        predictor_hidden=args.predictor_hidden,
+        predictor_dim_head=args.predictor_dim_head,
         predictor_dropout=args.predictor_dropout,
+        predictor_adaln_rank=args.predictor_adaln_rank,
         device=device,
+        # Training reads the precomputed patch cache; no need to hold
+        # the 344 MB DINOv3 weights in VRAM during training.
+        backbone_lazy=True,
     )
     trainable = [p for p in model.parameters() if p.requires_grad]
     frozen = [p for p in model.parameters() if not p.requires_grad]
-    print(f"[model]  trainable params: {sum(p.numel() for p in trainable):,}")
-    print(f"[model]  frozen params:    {sum(p.numel() for p in frozen):,}  "
-          f"(expected ≈ 85,660,416 for DINOv3 ViT-B)")
+    print(f"[model]  trainable: {sum(p.numel() for p in trainable):,}")
+    print(f"[model]  frozen:    {sum(p.numel() for p in frozen):,}")
 
+    # Fused AdamW — ~10% faster optimizer step on CUDA, zero accuracy change.
     opt = AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay, fused=True)
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
     warmup = min(args.warmup_steps, total_steps // 10)
 
-    # Compile the predictor for ~20-30% training speedup. Backbone isn't
-    # called during training (we use cached CLS).
-    if not getattr(args, "no_compile", False):
+    # Compile the predictor — the expensive module. ~20-30% speedup after
+    # a one-time ~30s compile stall on the first batch. backbone (DINOv3)
+    # isn't invoked during training (we use cached patches) so no need to
+    # compile it.
+    if not args.no_compile:
         model.predictor = compile_model(model.predictor, mode="reduce-overhead")
         print(f"[compile] predictor wrapped with torch.compile")
 
-    # ---- 4. Train ----
+    # 4. Train.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
     step = 0
@@ -451,6 +485,7 @@ def main() -> None:
 
     jepa_config = dict(
         dinov3_model_id=args.dinov3_id,
+        spatial_stride=args.spatial_stride,
         proprio_dim=int(proprio_dim),
         proprio_hidden=args.proprio_hidden,
         action_dim=int(action_dim),
@@ -460,17 +495,18 @@ def main() -> None:
         predictor_depth=args.predictor_depth,
         predictor_heads=args.predictor_heads,
         predictor_mlp_dim=args.predictor_mlp_dim,
+        predictor_hidden=args.predictor_hidden,
+        predictor_dim_head=args.predictor_dim_head,
         predictor_dropout=args.predictor_dropout,
+        predictor_adaln_rank=args.predictor_adaln_rank,
     )
 
     for epoch in range(1, args.epochs + 1):
-        # Train
         model.train()
-        # Keep DINOv3 in eval mode even in model.train() (may be None
-        # when backbone_lazy=True; v4 doesn't use lazy but guard anyway).
+        # Never un-freeze DINOv3 (may be None if backbone_lazy=True).
         if model.backbone.dinov3 is not None:
             model.backbone.dinov3.eval()
-        tr_pred, tr_roll = [], []
+        tr_pred, tr_roll, tr_std = [], [], []
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
@@ -478,13 +514,16 @@ def main() -> None:
             for pg in opt.param_groups:
                 pg["lr"] = args.lr * lr_mult
 
+            # BF16 autocast around forward+loss. Backward dispatches mixed
+            # precision automatically; no GradScaler needed (BF16 has
+            # FP32's exponent range on Ampere).
             with bf16_autocast():
                 info = compute_loss(
-                    model,
-                    batch,
+                    model, batch,
                     history_size=args.history_size,
                     num_preds=args.num_preds,
                     rollout_weight=args.rollout_weight,
+                    std_weight=args.std_weight,
                 )
             loss = info["loss"]
             opt.zero_grad(set_to_none=True)
@@ -493,20 +532,20 @@ def main() -> None:
 
             tr_pred.append(float(info["pred_loss"]))
             tr_roll.append(float(info["rollout_loss"]))
+            tr_std.append(float(info["std_loss"]))
             step += 1
 
-        # Val
         model.eval()
         with torch.no_grad(), bf16_autocast():
             va_pred, va_roll = [], []
             for batch in val_loader:
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                 info = compute_loss(
-                    model,
-                    batch,
+                    model, batch,
                     history_size=args.history_size,
                     num_preds=args.num_preds,
                     rollout_weight=args.rollout_weight,
+                    std_weight=args.std_weight,
                 )
                 va_pred.append(float(info["pred_loss"]))
                 va_roll.append(float(info["rollout_loss"]))
@@ -516,20 +555,18 @@ def main() -> None:
         va_roll_m = sum(va_roll) / max(1, len(va_roll))
         elapsed = time.perf_counter() - t_start
         cur_lr = opt.param_groups[0]["lr"]
+        tr_std_m = sum(tr_std) / max(1, len(tr_std))
         print(
             f"[epoch {epoch:>2}/{args.epochs}]  "
             f"train_pred={tr_pred_m:.4f}  train_roll={tr_roll_m:.4f}  "
+            f"train_std={tr_std_m:.4f}  "
             f"val_pred={va_pred_m:.4f}  val_roll={va_roll_m:.4f}  "
             f"lr={cur_lr:.2e}  ({elapsed:.1f}s)"
         )
 
-        # Checkpoint every epoch; also save best-val.
-        # Persist only TRAINABLE state (predictor, proprio_encoder,
-        # action_encoder) — DINOv3 is reloaded from HF at load time, so
-        # storing its 344 MB of weights would bloat every epoch ckpt
-        # for no benefit.
-        # Strip the torch.compile ``_orig_mod.`` prefix so loaders see
-        # the same keys as an uncompiled model.
+        # Save only trainable state (not frozen DINOv3). Strip the
+        # torch.compile ``_orig_mod.`` prefix so loaders see the same
+        # keys as an uncompiled model.
         def _normalize_key(k: str) -> str:
             return k.replace("predictor._orig_mod.", "predictor.")
 
@@ -554,7 +591,7 @@ def main() -> None:
             best_val = va_pred_m
             torch.save(ckpt, args.out_dir / "best.pt")
 
-    print(f"\n=== M4.5 JEPAv4 done in {time.perf_counter() - t_start:.1f}s ===")
+    print(f"\n=== M4.6 JEPAv5 done in {time.perf_counter() - t_start:.1f}s ===")
     print(f"best val_pred: {best_val:.4f}")
     print(f"artifacts in:  {args.out_dir}")
 

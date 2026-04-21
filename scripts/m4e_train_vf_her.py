@@ -151,10 +151,11 @@ def main() -> None:
     print(f"batch: {args.batch_size}  epochs: {args.epochs}  lr: {args.lr}")
     print()
 
-    # 1. Precompute DINOv3 embeddings (cache hit if v4 training already ran).
-    cache_path, emb_cache = precompute_embeddings(
-        args.h5, args.cache_dir, device=device
-    )
+    # 1. Precompute DINOv3 embeddings (cache hit if v4 training already
+    # ran). Returns a memory-mapped tensor view.
+    cache = precompute_embeddings(args.h5, args.cache_dir, device=device)
+    emb_cache = cache.tensor
+    print(f"[cache]  {cache.describe()}")
 
     # 2. Load JEPAv4 to extract its trained proprio_encoder.
     jepa = load_jepa_v4_from_checkpoint(str(args.ckpt_jepa_v4), device=device)
@@ -185,7 +186,9 @@ def main() -> None:
         p.requires_grad_(False)
     print(f"[vf]   trainable params: {sum(p.numel() for p in vf.parameters() if p.requires_grad):,}")
 
-    opt = AdamW(vf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = AdamW(
+        vf.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True
+    )
 
     args.out_path.parent.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
