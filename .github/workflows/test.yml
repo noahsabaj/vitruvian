@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+# Cancel redundant runs on the same branch when new commits land.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python 3.12, Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # We don't need external/mujoco_menagerie for the test suite —
+        # tests use mocked backbones + synthetic HDF5, never loading
+        # the G1 scene XML.
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        # Full dep tree including jax[cuda12] — CUDA wheels are pulled
+        # but never exercised because tests run on CPU with mocked
+        # backbones. This mirrors the dev env exactly so "works in CI"
+        # means "works on a dev machine too."
+        run: uv sync --locked
+
+      - name: Run pytest
+        run: uv run pytest tests/ -v --tb=short
+
+      - name: Report test count
+        if: always()
+        run: uv run pytest tests/ --collect-only -q 2>&1 | tail -3

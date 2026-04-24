@@ -2,6 +2,8 @@
 
 *A minimum viable humanoid as a substrate for machine intelligence.*
 
+[![Tests](https://github.com/noahsabaj/vitruvian/actions/workflows/test.yml/badge.svg)](https://github.com/noahsabaj/vitruvian/actions/workflows/test.yml)
+
 ---
 
 ## Status
