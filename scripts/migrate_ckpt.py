@@ -103,7 +103,7 @@ def migrate_ckpt(
 
     out = dst if dst is not None else src
     if dry_run:
-        print(f"  [dry-run] would write migrated v{legacy} → {out}")
+        print(f"  [dry-run] would write migrated {legacy} → {out}")
         return True
 
     if dst is None and make_backup:
@@ -115,7 +115,7 @@ def migrate_ckpt(
             print(f"  backup already exists at {bak}; not overwriting")
 
     torch.save(new_ckpt, out)
-    print(f"  wrote migrated v{legacy} → {out}")
+    print(f"  wrote migrated {legacy} → {out}")
     return True
 
 
