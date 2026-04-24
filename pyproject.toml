@@ -29,7 +29,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "mypy>=1.11",
     "pytest>=8.0",
+    "types-PyYAML",
 ]
 
 [project.scripts]
@@ -52,4 +54,53 @@ venv = ".venv"
 # `pytest` would also collect the 96 vendor tests under
 # external/mujoco_menagerie/test/, which couples our CI to upstream.
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/vitruvian"]
+# These are the third-party libraries we depend on that don't ship
+# type stubs (or whose stubs are incomplete enough that strict fails).
+# Missing-import errors are noise; we still type-check our own usage.
+[[tool.mypy.overrides]]
+module = [
+    "brax.*",
+    "einops.*",
+    "h5py.*",
+    "jax.*",
+    "mediapy.*",
+    "mujoco.*",
+    "mujoco_playground.*",
+    "mujoco_warp.*",
+    "scipy.*",
+    "torchvision.*",
+    "transformers.*",
+    "warp.*",
+]
+ignore_missing_imports = true
+
+# Vendored LeWM code — kept close to upstream intentionally; not worth
+# re-typing against our strict style.
+[[tool.mypy.overrides]]
+module = ["vitruvian.lewm_compat.*"]
+ignore_errors = true
+
+# Glue layers (CLI entry points + heavy JAX/MuJoCo/brax orchestration)
+# are mostly dict[str, Any] + untyped third-party calls. Strict-typing
+# them yields diminishing returns; keep strict on the library core.
+[[tool.mypy.overrides]]
+module = [
+    "vitruvian.cli.*",
+    "vitruvian.env.*",
+    "vitruvian.data.collection",
+]
+disable_error_code = [
+    "type-arg",
+    "no-untyped-def",
+    "no-untyped-call",
+    "no-any-return",
+    "union-attr",
+    "assignment",
+    "unused-ignore",
+]
 

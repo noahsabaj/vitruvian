@@ -21,6 +21,7 @@ embeddings. Proprio + action arrays are materialized in host RAM at
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -53,7 +54,7 @@ def _valid_seq_starts(
     return np.asarray(valid, dtype=np.int64)
 
 
-class G1EmbSeqDataset(Dataset):
+class G1EmbSeqDataset(Dataset[dict[str, Any]]):
     """CLS-shaped fixed-length windows for v4 training.
 
     Yields per-sample dicts::
@@ -91,7 +92,7 @@ class G1EmbSeqDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_idx)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         t0 = int(self.valid_idx[idx])
         s = slice(t0, t0 + self.seq_len)
         return {
@@ -101,7 +102,7 @@ class G1EmbSeqDataset(Dataset):
         }
 
 
-class G1PatchSeqDataset(Dataset):
+class G1PatchSeqDataset(Dataset[dict[str, Any]]):
     """Patch-shaped fixed-length windows for v5 training.
 
     Yields per-sample dicts::
@@ -138,7 +139,7 @@ class G1PatchSeqDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_idx)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         t0 = int(self.valid_idx[idx])
         s = slice(t0, t0 + self.seq_len)
         return {
@@ -148,7 +149,7 @@ class G1PatchSeqDataset(Dataset):
         }
 
 
-class G1HERTransitionDataset(Dataset):
+class G1HERTransitionDataset(Dataset[dict[str, Any]]):
     """HER-relabeled ``(s, s', g)`` transitions for VF training.
 
     For each ``(t, t+1)`` pair within an episode, samples a goal index
@@ -200,7 +201,7 @@ class G1HERTransitionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_idx)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         t = int(self.valid_idx[idx])
         g = int(self.goal_idx[idx])
         return {

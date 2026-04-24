@@ -34,7 +34,7 @@ change.
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
@@ -66,16 +66,20 @@ def compile_model(
     Returns:
         The compiled module (same public API; torch wraps it).
     """
-    return torch.compile(
+    # torch.compile returns an OptimizedModule wrapper whose type stubs
+    # are a callable-any rather than nn.Module; it DOES duck-type as a
+    # module (same .parameters(), .eval(), forward via __call__).
+    compiled: "nn.Module" = torch.compile(  # type: ignore[assignment]
         model,
         mode=mode,
         dynamic=dynamic,
         fullgraph=fullgraph,
     )
+    return compiled
 
 
 @contextlib.contextmanager
-def bf16_autocast(enabled: bool = True):
+def bf16_autocast(enabled: bool = True) -> Iterator[None]:
     """BF16 autocast context. Our GPU has BF16 tensor cores and BF16
     has FP32's exponent range — no GradScaler needed, no loss scaler,
     pure speedup.
@@ -96,7 +100,7 @@ def bf16_autocast(enabled: bool = True):
 
 
 def compile_and_warm(
-    model: "nn.Module", *example_inputs
+    model: "nn.Module", *example_inputs: Any
 ) -> "nn.Module":
     """Compile a model and (optionally) run one warmup call so the
     first production invocation doesn't eat the torch.compile stall.

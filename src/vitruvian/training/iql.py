@@ -42,7 +42,8 @@ class ValueHead(nn.Module):
 
     def forward(self, s_emb: torch.Tensor, g_emb: torch.Tensor) -> torch.Tensor:
         """Returns scalar ``V ≤ 0``."""
-        return -((self.f(s_emb) - self.f(g_emb)) ** 2).sum(-1)
+        v: torch.Tensor = -((self.f(s_emb) - self.f(g_emb)) ** 2).sum(-1)
+        return v
 
 
 def ema_update(target: nn.Module, source: nn.Module, rate: float) -> None:
@@ -104,7 +105,8 @@ class VFHERTrainer:
     def fuse(
         self, emb_vis: torch.Tensor, proprio: torch.Tensor
     ) -> torch.Tensor:
-        return emb_vis + self.proprio_encoder(proprio.float())
+        prop_emb: torch.Tensor = self.proprio_encoder(proprio.float())
+        return emb_vis + prop_emb
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         s_emb = self.fuse(batch["emb_t"], batch["prop_t"])

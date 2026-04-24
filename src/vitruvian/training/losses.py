@@ -13,8 +13,21 @@
 
 from __future__ import annotations
 
+from typing import Any, Protocol
+
 import torch
 from torch import nn
+
+
+class _JEPALike(Protocol):
+    """Structural protocol for the duck-typed JEPA models this module
+    consumes (the unified ``JEPA`` + any shim of the same shape)."""
+
+    proprio_encoder: nn.Module | None
+    patch_projector: nn.Module | None
+    action_encoder: nn.Module
+
+    def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor: ...
 
 
 def vicreg_std_loss(emb: torch.Tensor, *, eps: float = 1e-4) -> torch.Tensor:
@@ -34,14 +47,14 @@ def _fuse_proprio(
 ) -> torch.Tensor:
     if proprio_encoder is None:
         return emb
-    prop_emb = proprio_encoder(proprio.float())  # (B, T, hidden)
+    prop_emb: torch.Tensor = proprio_encoder(proprio.float())  # (B, T, hidden)
     if emb.dim() == 4:
         return emb + prop_emb.unsqueeze(2)
     return emb + prop_emb
 
 
 def _compute_emb(
-    model: nn.Module, batch: dict[str, torch.Tensor]
+    model: _JEPALike, batch: dict[str, torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the per-frame embedding the predictor will consume.
 
@@ -73,14 +86,14 @@ def _compute_emb(
 
 
 def prediction_loss(
-    model: nn.Module,
+    model: _JEPALike,
     batch: dict[str, torch.Tensor],
     *,
     history_size: int,
     num_preds: int,
     rollout_weight: float = 1.0,
     std_weight: float = 0.0,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Terver-recipe training loss for any JEPA shape.
 
     Recipe (Terver et al. arXiv:2512.24497 eq. 5):

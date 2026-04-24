@@ -56,7 +56,8 @@ class _MHA(nn.Module):
             is_causal=causal,
         )
         out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.to_out(out)
+        projected: torch.Tensor = self.to_out(out)
+        return projected
 
 
 class PatchBlock(nn.Module):
@@ -218,7 +219,8 @@ class PatchARPredictor(nn.Module):
         for blk in self.blocks:
             x = blk(x, c_trunk)
         x = self.norm_out(x)
-        return self.output_proj(x)
+        out: torch.Tensor = self.output_proj(x)
+        return out
 
 
 __all__ = ["ARPredictor", "PatchARPredictor", "PatchBlock"]

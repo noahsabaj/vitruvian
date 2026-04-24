@@ -23,7 +23,7 @@ three files in the legacy ``vitruvian.hwm`` package):
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -78,7 +78,10 @@ class DINOv3ClsBackbone(nn.Module):
         self.device_str = device
         self.frozen = freeze
 
-        self.dinov3 = AutoModel.from_pretrained(model_id, dtype=dtype).to(device)
+        # Typed Any because HF AutoModel returns a dynamic subclass that
+        # carries attributes mypy can't introspect (config.hidden_size,
+        # last_hidden_state on outputs, etc.).
+        self.dinov3: Any = AutoModel.from_pretrained(model_id, dtype=dtype).to(device)
         if freeze:
             for p in self.dinov3.parameters():
                 p.requires_grad_(False)
@@ -124,9 +127,8 @@ class DINOv3ClsBackbone(nn.Module):
                 out = self.dinov3(pixel_values=pixels_flat)
         else:
             out = self.dinov3(pixel_values=pixels_flat)
-        cls = out.last_hidden_state[:, 0, :]  # (B*T, D)
-        cls = cls.float().reshape(B, T, -1)
-        return cls
+        cls: torch.Tensor = out.last_hidden_state[:, 0, :]  # (B*T, D)
+        return cls.float().reshape(B, T, -1)
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
@@ -181,7 +183,8 @@ class DINOv3PatchBackbone(nn.Module):
         self.frozen = freeze
         self.spatial_stride = int(spatial_stride)
         self._normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-        self.dinov3: nn.Module | None = None
+        # Any: HF AutoModel is a dynamic subclass that mypy can't introspect.
+        self.dinov3: Any = None
 
         if lazy:
             self.output_dim = 768
@@ -263,8 +266,10 @@ class DINOv3PatchBackbone(nn.Module):
         if self.spatial_stride > 1:
             patches = patches[:, :: self.spatial_stride, :: self.spatial_stride, :]
         patches = patches.reshape(B * T, self.n_patches, -1)
-        patches = patches.float().reshape(B, T, self.n_patches, -1)
-        return patches
+        out_patches: torch.Tensor = patches.float().reshape(
+            B, T, self.n_patches, -1
+        )
+        return out_patches
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
@@ -283,8 +288,16 @@ class LeWMBackbone(nn.Module):
             (192 for ViT-tiny).
     """
 
+    # Declared at the class level so mypy honors the Any across every
+    # method (per-assignment `self.jepa: Any = ...` only annotates the
+    # RHS, not the class attribute's general type).
+    jepa: Any
+
     def __init__(self, jepa: nn.Module, freeze: bool = True) -> None:
         super().__init__()
+        # Legacy LeWM JEPA composer with a dynamic .encode(info: dict)
+        # API that mypy can't introspect — Any avoids cascading
+        # Tensor-vs-Module confusion for every attribute access.
         self.jepa = jepa
         self.frozen = freeze
         if freeze:
@@ -307,7 +320,8 @@ class LeWMBackbone(nn.Module):
             pixels = pixels.float() / 255.0
         elif pixels.dtype != torch.float32:
             pixels = pixels.float()
-        return self._normalize(pixels)
+        normalized: torch.Tensor = self._normalize(pixels)
+        return normalized
 
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
         pixels = self._prep(pixels)
@@ -316,7 +330,8 @@ class LeWMBackbone(nn.Module):
                 info = self.jepa.encode({"pixels": pixels})
         else:
             info = self.jepa.encode({"pixels": pixels})
-        return info["emb"]
+        emb: torch.Tensor = info["emb"]
+        return emb
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
@@ -352,7 +367,8 @@ def load_lewm_jepa_from_checkpoint(
     state = ckpt["state_dict"]
 
     def _vit_tiny_config() -> ViTConfig:
-        return ViTConfig(
+        # transformers' stubs don't expose these kwargs; they are real.
+        return ViTConfig(  # type: ignore[call-arg]
             hidden_size=192,
             num_hidden_layers=12,
             num_attention_heads=3,

@@ -28,7 +28,7 @@ def _coerce_scalar(s: str) -> Any:
     return s
 
 
-def _apply_override(cfg: dict, dotted: str) -> None:
+def _apply_override(cfg: dict[str, Any], dotted: str) -> None:
     if "=" not in dotted:
         raise ValueError(
             f"override must be 'key.path=value'; got {dotted!r}"
@@ -45,7 +45,7 @@ def _apply_override(cfg: dict, dotted: str) -> None:
 
 def load_config(
     path: str | Path, overrides: list[str] | None = None
-) -> dict:
+) -> dict[str, Any]:
     """Load a YAML config and apply dotted overrides.
 
     Args:

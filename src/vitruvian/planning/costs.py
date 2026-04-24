@@ -95,9 +95,12 @@ class ValueHeadCost:
                 f"ValueHeadCost expects (K, D), got {tuple(pred.shape)}. "
                 "Patch-latent VF head is not implemented."
             )
-        f_pred = self.value_head.f(pred)  # (K, d_v)
-        f_goal = self.value_head.f(goal.to(pred.device, pred.dtype).unsqueeze(0))
-        return ((f_pred - f_goal) ** 2).sum(dim=-1)
+        f_pred: torch.Tensor = self.value_head.f(pred)  # type: ignore[operator]  # (K, d_v)
+        f_goal: torch.Tensor = self.value_head.f(  # type: ignore[operator]
+            goal.to(pred.device, pred.dtype).unsqueeze(0)
+        )
+        cost: torch.Tensor = ((f_pred - f_goal) ** 2).sum(dim=-1)
+        return cost
 
 
 __all__ = ["CostFn", "MSECost", "PatchMSECost", "ValueHeadCost"]

@@ -47,7 +47,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 
@@ -108,7 +108,7 @@ class EmbeddingCache:
         path: Path,
         meta_path: Path,
         tensor: torch.Tensor,
-        metadata: dict,
+        metadata: dict[str, Any],
     ) -> None:
         self.path = Path(path)
         self.meta_path = Path(meta_path)
@@ -141,7 +141,7 @@ class EmbeddingCache:
         cls,
         cache_dir: Path,
         key: CacheKey,
-        compute_fn: Callable[[], tuple[torch.Tensor, dict]],
+        compute_fn: Callable[[], tuple[torch.Tensor, dict[str, Any]]],
         *,
         verbose: bool = True,
     ) -> "EmbeddingCache":

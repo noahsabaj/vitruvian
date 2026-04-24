@@ -205,8 +205,7 @@ def _migrate_v4_config(cfg_v4: dict[str, Any]) -> dict[str, Any]:
                     "norm_fn": None,
                 }
             }
-            if cfg_v4.get("proprio_dim") is not None
-            and cfg_v4.get("proprio_dim") > 0
+            if (cfg_v4.get("proprio_dim") or 0) > 0
             else None
         ),
         "patch_projector": None,
@@ -263,8 +262,7 @@ def _migrate_v5_config(cfg_v5: dict[str, Any]) -> dict[str, Any]:
                     "norm_fn": None,
                 }
             }
-            if cfg_v5.get("proprio_dim") is not None
-            and cfg_v5.get("proprio_dim") > 0
+            if (cfg_v5.get("proprio_dim") or 0) > 0
             else None
         ),
         "patch_projector": {

@@ -45,6 +45,9 @@ jobs:
       - name: Run pytest
         run: uv run pytest tests/ -v --tb=short
 
+      - name: Run mypy --strict
+        run: uv run mypy src/vitruvian/
+
       - name: Report test count
         if: always()
         run: uv run pytest tests/ --collect-only -q 2>&1 | tail -3

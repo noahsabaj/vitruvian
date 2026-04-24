@@ -24,6 +24,8 @@ Supports two input modes (same as legacy):
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -52,7 +54,11 @@ class MPPIPlanner(nn.Module):
         device: str = "cuda",
     ) -> None:
         super().__init__()
-        self.jepa = jepa
+        # Any: JEPA composer exposes .rollout(info, ...) with a dynamic
+        # dict contract; backbone exposes .encode() and .output_dim as
+        # duck-typed attrs. Both cases are Tensor-vs-Module narrowed by
+        # nn.Module's dynamic-attr access unless we skip typing them.
+        self.jepa: Any = jepa
         self.backbone = backbone
         self.action_dim = int(action_dim)
         self.horizon = int(horizon)
@@ -226,10 +232,12 @@ class MPPIPlanner(nn.Module):
         return U
 
 
-def encode_goal(backbone: nn.Module, goal_pixel: torch.Tensor) -> torch.Tensor:
+def encode_goal(backbone: Any, goal_pixel: torch.Tensor) -> torch.Tensor:
     """Encode a single goal image through any :class:`Backbone`.
 
-    Accepts ``(H, W, 3)`` uint8, ``(3, H, W)`` uint8/float, or
+    ``backbone`` is duck-typed to the :class:`~vitruvian.models.Backbone`
+    protocol (``.encode(pixels)`` and ``.output_dim``). Accepts
+    ``(H, W, 3)`` uint8, ``(3, H, W)`` uint8/float, or
     ``(B, 3, H, W)`` float in ``[0, 1]``. Returns the backbone's native
     per-frame latent (trailing dims preserved, leading batch + time
     dims squeezed).
@@ -241,7 +249,7 @@ def encode_goal(backbone: nn.Module, goal_pixel: torch.Tensor) -> torch.Tensor:
     if goal_pixel.dtype == torch.uint8:
         goal_pixel = goal_pixel.float() / 255.0
     goal_pixel = goal_pixel.unsqueeze(1)
-    emb = backbone.encode(goal_pixel)
+    emb: torch.Tensor = backbone.encode(goal_pixel)
     return emb.squeeze(0).squeeze(0)
 
 

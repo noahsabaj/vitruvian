@@ -27,15 +27,19 @@ shape is behind it.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol, TypeVar
 
 import torch
 import torch.nn as nn
 from einops import rearrange
 
+_T = TypeVar("_T")
 
-def _detach_clone(v):
-    return v.detach().clone() if torch.is_tensor(v) else v
+
+def _detach_clone(v: _T) -> _T:
+    if torch.is_tensor(v):
+        return v.detach().clone()  # type: ignore[return-value]
+    return v
 
 
 class _BackboneLike(Protocol):
@@ -93,19 +97,20 @@ class JEPA(nn.Module):
     def _project(self, emb_raw: torch.Tensor) -> torch.Tensor:
         if self.patch_projector is None:
             return emb_raw
-        return self.patch_projector(emb_raw)
+        projected: torch.Tensor = self.patch_projector(emb_raw)
+        return projected
 
     def _fuse_proprio(
         self, emb: torch.Tensor, proprio: torch.Tensor
     ) -> torch.Tensor:
         if self.proprio_encoder is None:
             return emb
-        prop_emb = self.proprio_encoder(proprio.float())  # (B, T, hidden)
+        prop_emb: torch.Tensor = self.proprio_encoder(proprio.float())
         if emb.dim() == 4:  # patch latents: broadcast over N
             return emb + prop_emb.unsqueeze(2)
         return emb + prop_emb  # flat CLS: direct sum
 
-    def encode(self, info: dict) -> dict:
+    def encode(self, info: dict[str, Any]) -> dict[str, Any]:
         """Encode pixels (+ optional proprio) to the JEPA latent.
 
         ``info`` must contain ``"pixels": (B, T, 3, H, W)``. If
@@ -130,14 +135,15 @@ class JEPA(nn.Module):
         """Delegate to the underlying predictor. Accepts both 3-D and
         4-D embeddings; the predictor itself imposes the shape check.
         """
-        return self.predictor(emb, act_emb)
+        out: torch.Tensor = self.predictor(emb, act_emb)
+        return out
 
     def rollout(
         self,
-        info: dict,
+        info: dict[str, Any],
         action_sequence: torch.Tensor,
         history_size: int = 3,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Autoregressive latent rollout for MPPI candidate scoring.
 
         Accepts EITHER pre-encoded ``info["emb"]`` OR raw
@@ -234,7 +240,8 @@ class PlannerBackbone(nn.Module):
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
         raw = self.jepa.backbone.encode(pixels)
         if self.jepa.patch_projector is not None:
-            return self.jepa.patch_projector(raw)
+            projected: torch.Tensor = self.jepa.patch_projector(raw)
+            return projected
         return raw
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:

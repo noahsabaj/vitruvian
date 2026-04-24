@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 import h5py
 import torch
@@ -41,7 +42,7 @@ from vitruvian.utils.compile_utils import bf16_autocast, compile_model
 
 def _stream_encode(
     h5_path: Path,
-    encode: callable,
+    encode: Callable[[torch.Tensor], torch.Tensor],
     *,
     out_shape: tuple[int, ...],
     out_dtype: torch.dtype,
@@ -94,8 +95,8 @@ def _build_cls_compute_fn(
     batch_size: int,
     device: str,
     dtype: torch.dtype,
-):
-    def _compute() -> tuple[torch.Tensor, dict]:
+) -> Callable[[], tuple[torch.Tensor, dict[str, Any]]]:
+    def _compute() -> tuple[torch.Tensor, dict[str, Any]]:
         backbone = DINOv3ClsBackbone(
             model_id=model_id, device=device, dtype=dtype
         )
@@ -133,8 +134,8 @@ def _build_patch_compute_fn(
     batch_size: int,
     device: str,
     dtype: torch.dtype,
-):
-    def _compute() -> tuple[torch.Tensor, dict]:
+) -> Callable[[], tuple[torch.Tensor, dict[str, Any]]]:
+    def _compute() -> tuple[torch.Tensor, dict[str, Any]]:
         backbone = DINOv3PatchBackbone(
             model_id=model_id,
             device=device,

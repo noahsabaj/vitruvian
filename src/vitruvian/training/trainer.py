@@ -45,7 +45,7 @@ class TrainerConfig:
     seed: int = 0
 
 
-LossFn = Callable[[nn.Module, dict], dict]
+LossFn = Callable[[nn.Module, dict[str, Any]], dict[str, Any]]
 
 
 def cosine_lr_factor(
@@ -96,7 +96,11 @@ class JEPATrainer:
         jepa_config: dict[str, Any] | None = None,
         frozen_key_prefixes: tuple[str, ...] = ("backbone.dinov3.",),
     ) -> None:
-        self.jepa = jepa
+        # Any: the JEPA composer exposes .backbone.dinov3, .predictor,
+        # etc. as submodules that mypy narrows to Tensor|Module under
+        # nn.Module's dynamic-attr access. The dynamic-attr duck-typing
+        # is the whole point of the shared trainer.
+        self.jepa: Any = jepa
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.out_dir = Path(out_dir)
@@ -121,7 +125,7 @@ class JEPATrainer:
                 self.jepa.predictor, mode="reduce-overhead"
             )
 
-    def _autocast(self):
+    def _autocast(self) -> Any:
         return bf16_autocast() if self.cfg.bf16 else _noop_cm()
 
     def _collect_trainable_state(self) -> dict[str, torch.Tensor]:
@@ -154,8 +158,8 @@ class JEPATrainer:
 
     def fit(
         self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
+        train_loader: DataLoader[Any],
+        val_loader: DataLoader[Any],
         *,
         device: str = "cuda",
     ) -> dict[str, float]:
@@ -257,8 +261,11 @@ class JEPATrainer:
 
 
 class _noop_cm:
-    def __enter__(self): return None
-    def __exit__(self, *a): return None
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *a: Any) -> None:
+        return None
 
 
 __all__ = ["JEPATrainer", "TrainerConfig", "cosine_lr_factor"]
