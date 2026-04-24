@@ -38,8 +38,9 @@ jobs:
         # Full dep tree including jax[cuda12] — CUDA wheels are pulled
         # but never exercised because tests run on CPU with mocked
         # backbones. This mirrors the dev env exactly so "works in CI"
-        # means "works on a dev machine too."
-        run: uv sync --locked
+        # means "works on a dev machine too." --all-extras pulls the
+        # optional `dev` group which carries pytest.
+        run: uv sync --locked --all-extras
 
       - name: Run pytest
         run: uv run pytest tests/ -v --tb=short
