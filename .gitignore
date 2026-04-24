@@ -76,3 +76,5 @@ renders/
 # --- stray tool outputs ---
 # Some tool creates an empty tea_debug.log at repo root on commit. No idea which.
 tea_debug.log
+# Codex (OpenAI CLI) drops an empty .codex breadcrumb file on invocation.
+.codex
