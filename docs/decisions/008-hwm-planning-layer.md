@@ -1,7 +1,22 @@
 # ADR 008 — Hierarchical World Models (HWM) as the Planning Layer
 
-**Status:** Accepted
+**Status:** Superseded (amended 2026-04-23, M4.8)
 **Date:** 2026-04-17
+
+> **Amendment (M4.8, 2026-04-23):** HWM's hierarchical planning layer
+> was retired after M4.4c demonstrated that flat MPPI on primitives
+> (no high-level macro-action model) matches what the HL head
+> delivered. The `HighLevelPlanner` / `HierarchicalPlanner` /
+> `MacroActionEncoder` / `MacroNNRetriever` / `HighLevelModel` classes
+> and the M4.4 high-level training script were deleted in the M4.8
+> polish pass. What survives as the planning layer is
+> `vitruvian.planning.MPPIPlanner` (formerly `LowLevelPlanner`) with
+> pluggable cost strategies (`MSECost` / `PatchMSECost` /
+> `ValueHeadCost`). The HWM *codebase* under `external/hwm/` is
+> likewise retired — its role was always just a reference for MPPI
+> math and the hierarchical-planner reference implementation, both
+> now absorbed. The original decision below is preserved for its
+> rationale; the flat-planner outcome is what's in production.
 
 ## Context
 

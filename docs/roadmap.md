@@ -2,7 +2,7 @@
 
 *Living document. Updated each session.*
 
-**Last updated:** 2026-04-16
+**Last updated:** 2026-04-23
 
 ---
 
@@ -93,39 +93,47 @@ Milestones picked on demand, not committed in advance.
 
 ---
 
-### Phase 3 — World Models on G1 *(current focus after Phase 1 closure)*
+### Phase 3 — World Models on G1 *(complete, 2026-04-23)*
 
-Replace the policy-only baseline with **Dreamer 4** (arXiv 2509.24527,
-Sep 2025 — the current Hafner-lineage SOTA, superseding Dreamer V3),
-with **TD-MPC2** carried as a parallel track. Mount a simulated head
-camera on G1; attach **DINOv3** (dense spatial, commercial license)
-and **V-JEPA 2.1** (temporal, arXiv 2603.14482, Mar 2026,
-CC-BY-NC-ND — `+20pt` real-robot grasping vs V-JEPA 2 AC) as
-complementary frozen visual encoders. This is where the graduated
-architecture lands in earnest: frozen evolutionary-equivalent priors +
-plastic world model running continuous self-supervised prediction.
+Replaced the policy-only baseline with a DINOv3-backed JEPA world
+model driving an MPPI planner. Originally scoped as Dreamer 4 +
+TD-MPC2; landed on LeWM (M4.1–M4.3) → Chinchilla-scaled JEPAv4
+(M4.5) → patch-latent JEPAv5 (M4.6) → unified library (M4.8/M4.9).
+This is where the graduated architecture arrived: frozen
+evolutionary-equivalent prior (DINOv3) + plastic world-model stack
+(proprio encoder, action encoder, patch predictor) + MPPI planner
+on top.
 
-See [ADR 003](decisions/003-graduated-vitruvian.md) (with the
-2026-04-16 addendum) for candidate lists.
+See [ADR 003](decisions/003-graduated-vitruvian.md) for candidate
+lists and [ADRs 007 / 008](decisions/) for the world-model +
+planning-layer decisions.
 
-**Staging (one milestone per session, roughly):**
+**Completed milestone history:**
 
-| Milestone | What |
-|---|---|
-| **M2** | Add a simulated head camera to the G1 env; render its feed during training; confirm observations flow through the pipeline. |
-| **M3** | Wire up **DINOv3** (dense / spatial) and/or **V-JEPA 2.1** (temporal, +20pt real-robot grasping vs V-JEPA 2) as a frozen visual encoder; confirm we can process camera observations through it and surface the latent to the policy. |
-| **M4** | Replace PPO with **LeWM + HWM** hierarchical planning ([ADR 007](decisions/007-lewm-world-model.md) + [ADR 008](decisions/008-hwm-planning-layer.md)). M4.1-3 already wired the low-level LeWM world model on a 20k-step G1 expert dataset. M4.4 adds the high-level macro-action world model (HWM recipe) on top of LeWM's frozen encoder, then hierarchical CEM plans primitive actions toward goal-image latents. Research arc: one session per M4.4a-d (vendor HWM, train high level, implement hierarchical CEM, full eval). |
-| **M5** | Reward ablation: how much of G1's walking behavior survives with the `tracking_lin_vel` reward zeroed out and only self-supervised prediction + intrinsic-motivation signals driving exploration? First test of the self-learning commitment. (Bridges into Phase 4.) |
+| Milestone | Status | What shipped |
+|---|---|---|
+| **M2** | ✓ 2026-04-17 | Simulated head camera on G1 torso; rendered view flows through training pipeline. |
+| **M3** | ✓ 2026-04-17 | DINOv3 ViT-B/16 (Meta, Apache-2.0) as the frozen visual encoder; ImageNet-normalized 224² pipeline; CLS + patch paths both tested. |
+| **M4.1–M4.3** | ✓ | LeWM low-level world model on 20k-step G1 expert dataset. Plumbing proven; no steering signal yet (CLS pose-invariance issue). |
+| **M4.4** | ✓ | HWM hierarchical planning + flat MPPI baseline on primitives. HL head didn't improve planning; flat MPPI proved the plumbing end-to-end. |
+| **M4.5** | ✓ | Chinchilla-scaled rebuild: DINOv3 ViT-B/16 backbone, 38M-param predictor, 270k-transition diverse dataset, 6-step rollout supervision. `val_pred` fell 13.5× vs M4.4. |
+| **M4.6** | ✓ | Patch-latent JEPAv5 (7×7 subsampled) to recover pose discrimination that CLS couldn't provide. First measurable MPPI steering signal. |
+| **M4.7** | ✓ | Unified infrastructure refactor: EmbeddingCache (mmap), compile_utils (BF16 + torch.compile), EncoderHistory (encode-once), shared-AdaLN predictor, single-process eval driver. End-to-end cycle ≤ 50% of pre-refactor wall time. |
+| **M4.8** | ✓ 2026-04-23 | Installable library: unified `JEPA` + registry, `MPPIPlanner` + cost strategies, `JEPATrainer`, `vit-*` CLI + YAML configs, 36 CPU tests, LeWM vendored. M4.4 HWM research code + 9 legacy scripts deleted; hwm/ shim layer removed. |
+| **M4.9** | ✓ 2026-04-23 | Finish-the-polish: inline DINOv3 precompute into vit-train; port collect orchestrator; write `scripts/migrate_ckpt.py`; retire `external/le-wm` + `external/hwm` submodules. |
+| **M4.9.1** | ✓ 2026-04-23 | Cold-review cleanup pass (9 GPT-5.5 findings): restored 1-step-TF prediction loss, pruned `lewm-v3` registry stub, renamed `compile_and_warm`, added collection fail-loud + `--allow-partial`, scoped pytest to `tests/`, full docs refresh. |
+| **M5** | (open) | Reward ablation: how much of G1's walking behavior survives with the `tracking_lin_vel` reward zeroed out and only self-supervised prediction + intrinsic-motivation signals driving exploration? First test of the self-learning commitment. (Bridges into Phase 4.) |
 
 ---
 
-### Phase 4 — Self-Learning
+### Phase 4 — Self-Learning *(current focus after Phase 3 closure)*
 
 Intrinsic motivation (RND / Plan2Explore / empowerment), episodic memory,
 long-horizon and sparse-reward tasks. The research question proper begins
 here.
 
-Not scoped in detail yet.
+Not scoped in detail yet — picked milestone-by-milestone as the Phase 3
+library stabilizes into production.
 
 ---
 

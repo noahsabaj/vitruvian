@@ -1,7 +1,21 @@
 # ADR 007 — LeWorldModel (LeWM) as Vitruvian's Plastic World Model
 
-**Status:** Accepted
+**Status:** Superseded (amended 2026-04-23, M4.9)
 **Date:** 2026-04-17
+
+> **Amendment (M4.9, 2026-04-23):** The `external/le-wm` submodule is
+> retired. The ~550 LOC of LeWM classes we actually depend on
+> (`Embedder`, `ARPredictor`, `MLP`, `Transformer` blocks, `SIGReg`,
+> and the legacy composer) are vendored in
+> `src/vitruvian/lewm_compat/` under Apache-2.0 attribution (see
+> `NOTICE` and `docs/archive/lewm_local_edits.patch`). The unified
+> `vitruvian.models.JEPA` composer + `build_jepa`/`load_jepa`
+> registry subsumes v3/v4/v5 JEPA shapes; LeWM's scratch-trained
+> ViT-tiny v3 path is kept loadable (via
+> `load_lewm_jepa_from_checkpoint`) for historical ckpts, but the
+> active world model since M4.5 has been DINOv3-backed (see
+> ADR 003 addendum). The original decision below is preserved for
+> its rationale; the implementation moved on.
 
 ## Context
 
