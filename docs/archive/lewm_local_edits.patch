@@ -1,0 +1,163 @@
+diff --git a/jepa.py b/jepa.py
+index 486fe93..69d7a79 100644
+--- a/jepa.py
++++ b/jepa.py
+@@ -17,6 +17,7 @@ class JEPA(nn.Module):
+         action_encoder,
+         projector=None,
+         pred_proj=None,
++        proprio_encoder=None,
+     ):
+         super().__init__()
+ 
+@@ -25,10 +26,16 @@ class JEPA(nn.Module):
+         self.action_encoder = action_encoder
+         self.projector = projector or nn.Identity()
+         self.pred_proj = pred_proj or nn.Identity()
++        # Optional proprioceptive encoder; feature-conditioning on the
++        # visual CLS embedding. See Terver et al. 2512.24497 (Fig 4a).
++        self.proprio_encoder = proprio_encoder
+ 
+     def encode(self, info):
+         """Encode observations and actions into embeddings.
+-        info: dict with pixels and action keys
++        info: dict with pixels and action keys. If ``proprio`` is
++        present and a ``proprio_encoder`` was provided at construction,
++        its embedding is summed with the pixel CLS embedding
++        (feature conditioning).
+         """
+ 
+         pixels = info['pixels'].float()
+@@ -37,7 +44,14 @@ class JEPA(nn.Module):
+         output = self.encoder(pixels, interpolate_pos_encoding=True)
+         pixels_emb = output.last_hidden_state[:, 0]  # cls token
+         emb = self.projector(pixels_emb)
+-        info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
++        emb = rearrange(emb, "(b t) d -> b t d", b=b)
++
++        if self.proprio_encoder is not None and "proprio" in info:
++            proprio = info["proprio"].float()  # (B, T, D_proprio)
++            prop_emb = self.proprio_encoder(proprio)  # (B, T, D)
++            emb = emb + prop_emb
++
++        info["emb"] = emb
+ 
+         if "action" in info:
+             info["act_emb"] = self.action_encoder(info["action"])
+diff --git a/train.py b/train.py
+index 044ebfc..cdc67be 100644
+--- a/train.py
++++ b/train.py
+@@ -16,14 +16,24 @@ from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBa
+ 
+ 
+ def lejepa_forward(self, batch, stage, cfg):
+-    """encode observations, predict next states, compute losses."""
++    """encode observations, predict next states, compute losses.
++
++    Two loss terms:
++        - pred_loss: 1-step teacher-forcing (original LeWM recipe)
++        - rollout_loss: k-step rollout (Paper 1 recipe, arXiv
++          2512.24497 Fig 3b). Enabled only if rollout.weight > 0
++          and num_preds >= 2.
++    """
+ 
+     ctx_len = cfg.wm.history_size
+     n_preds = cfg.wm.num_preds
+     lambd = cfg.loss.sigreg.weight
++    rollout_weight = cfg.loss.get("rollout", {}).get("weight", 0.0)
+ 
+     # Replace NaN values with 0 (occurs at sequence boundaries)
+     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
++    if "proprio" in batch:
++        batch["proprio"] = torch.nan_to_num(batch["proprio"], 0.0)
+ 
+     output = self.model.encode(batch)
+ 
+@@ -31,15 +41,43 @@ def lejepa_forward(self, batch, stage, cfg):
+     act_emb = output["act_emb"]
+ 
+     ctx_emb = emb[:, :ctx_len]
+-    ctx_act = act_emb[:, : ctx_len]
++    ctx_act = act_emb[:, :ctx_len]
+ 
+-    tgt_emb = emb[:, n_preds:] # label
+-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
++    tgt_emb = emb[:, n_preds:]  # label
++    pred_emb = self.model.predict(ctx_emb, ctx_act)  # pred
+ 
+-    # LeWM loss
++    # 1-step teacher-forcing MSE.
+     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
+-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
++
++    # k-step rollout loss (k=2..n_preds). We use the last TF prediction
++    # as the "next state", roll the predictor forward, and compare to
++    # the ground-truth embedding at that future step. Implements the
++    # k-step rollout in eq. (5) of Terver et al. 2512.24497.
++    if rollout_weight > 0 and n_preds >= 2:
++        rollout_losses = []
++        rolling_emb = ctx_emb  # (B, ctx_len, D)
++        for k in range(1, n_preds):
++            # shift window forward by one: drop oldest, append last pred
++            rolling_emb = torch.cat(
++                [rolling_emb[:, 1:], pred_emb[:, -1:]], dim=1
++            )
++            rolling_act = act_emb[:, k : k + ctx_len]
++            pred_emb = self.model.predict(rolling_emb, rolling_act)
++            # target: true embedding at position (k + ctx_len - 1)
++            tgt_k = emb[:, k + ctx_len - 1 : k + ctx_len]  # (B, 1, D)
++            rollout_losses.append(
++                (pred_emb[:, -1:] - tgt_k).pow(2).mean()
++            )
++        output["rollout_loss"] = sum(rollout_losses) / max(1, len(rollout_losses))
++    else:
++        output["rollout_loss"] = torch.zeros((), device=emb.device)
++
++    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
++    output["loss"] = (
++        output["pred_loss"]
++        + rollout_weight * output["rollout_loss"]
++        + lambd * output["sigreg_loss"]
++    )
+ 
+     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+     self.log_dict(losses_dict, on_step=True, sync_dist=True)
+@@ -100,7 +138,7 @@ def run(cfg):
+     )
+ 
+     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
+-    
++
+     projector = MLP(
+         input_dim=hidden_dim,
+         output_dim=embed_dim,
+@@ -115,12 +153,27 @@ def run(cfg):
+         norm_fn=torch.nn.BatchNorm1d,
+     )
+ 
++    # Optional proprioceptive encoder. Enabled when (a) proprio is
++    # loaded by the dataset and (b) cfg.wm.use_proprio is truthy. Its
++    # output is added to the visual CLS embedding inside JEPA.encode.
++    proprio_encoder = None
++    proprio_dim = getattr(cfg.wm, "proprio_dim", None)
++    use_proprio = cfg.wm.get("use_proprio", False)
++    if use_proprio and proprio_dim:
++        proprio_encoder = MLP(
++            input_dim=int(proprio_dim),
++            output_dim=embed_dim,
++            hidden_dim=256,
++            norm_fn=None,
++        )
++
+     world_model = JEPA(
+         encoder=encoder,
+         predictor=predictor,
+         action_encoder=action_encoder,
+         projector=projector,
+         pred_proj=predictor_proj,
++        proprio_encoder=proprio_encoder,
+     )
+ 
+     optimizers = {

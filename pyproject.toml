@@ -1,6 +1,6 @@
 [project]
 name = "vitruvian"
-version = "0.1.0"
+version = "0.4.8"
 description = "Minimum viable humanoid as a substrate for machine intelligence."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -18,6 +18,8 @@ dependencies = [
     "mujoco-mjx>=3.7.0",
     "mujoco-warp>=3.7.0.1",
     "playground>=0.2.0",
+    "pyyaml>=6.0",
+    "rich>=13.7",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "transformers>=5.5.4",
@@ -25,8 +27,17 @@ dependencies = [
     "warp-lang>=1.12.1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 vitruvian = "vitruvian:main"
+vit-train = "vitruvian.cli.train:main"
+vit-plan = "vitruvian.cli.plan:main"
+vit-eval = "vitruvian.cli.eval:main"
+vit-collect = "vitruvian.cli.collect:main"
 
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]

@@ -1,0 +1,16 @@
+# Default forward-walk plan config. 50-primitive macros × 10 = 10s walk.
+ckpt: ~/.vitruvian/m4f_v5/best.pt
+policy_ckpt: checkpoints/m1-g1-full/000043253760
+h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+goal_ep: 20
+n_macros: 10
+vel_cmd: [0.5, 0.0, 0.0]
+
+planner:
+  action_dim: 29
+  horizon: 50
+  num_samples: 64
+  noise_sigma: 0.02
+  lambda: 0.0025
+  iterations: 3
+  history_size: 3

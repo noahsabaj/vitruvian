@@ -1,0 +1,26 @@
+Vitruvian
+Copyright 2026 The Vitruvian Authors
+
+This product includes software developed by The Vitruvian Authors,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+---------------------------------------------------------------------
+Third-party components
+---------------------------------------------------------------------
+
+`src/vitruvian/lewm_compat/`
+    Contains portions of LeWM (Latent-action World Models), originally
+    developed by the LeWM authors and distributed under the Apache
+    License, Version 2.0. The vendored subset is a minimal,
+    interface-preserving copy of the classes Vitruvian depends on
+    (``Embedder``, ``ARPredictor``, ``MLP``, ``Transformer`` blocks,
+    ``SIGReg``, and the legacy ``JEPA`` composer) with light type
+    annotations added. No training loop, dataset loaders, or
+    Lightning scaffolding were copied.
+
+    Upstream: https://github.com/lucas-maes/le-wm  (see
+    docs/decisions/007-lewm-world-model.md for the adoption rationale).
+
+    The `external/le-wm` submodule was retired in M4.9; `lewm_compat/`
+    is the canonical vendored copy. Upstream diffs preserved in
+    `docs/archive/lewm_local_edits.patch`.

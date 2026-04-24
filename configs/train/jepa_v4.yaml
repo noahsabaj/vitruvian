@@ -1,0 +1,59 @@
+# M4.5 JEPAv4 recipe: frozen DINOv3 + trainable proprio MLP + ARPredictor.
+run_name: jepa_v4
+out_dir: ~/.vitruvian/jepa_v4
+
+jepa:
+  backbone:
+    name: dinov3-cls
+    kwargs:
+      model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+      freeze: true
+  proprio_encoder:
+    kwargs:
+      in_dim: 103
+      hidden: 256
+      out_dim: 768
+      norm_fn: null
+  action_encoder:
+    kwargs:
+      action_dim: 29
+      frameskip: 1
+      smoothed_dim: 10
+      emb_dim: 768
+  predictor:
+    name: ar
+    kwargs:
+      num_frames: 3
+      depth: 6
+      heads: 16
+      mlp_dim: 3072
+      input_dim: 768
+      hidden_dim: 768
+      output_dim: 768
+      dim_head: 64
+      dropout: 0.1
+
+trainer:
+  epochs: 3
+  batch_size: 64
+  lr: 1.0e-4
+  lr_floor: 3.0e-5
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  bf16: true
+  compile_predictor: true
+  num_workers: 4
+  val_frac: 0.05
+  seed: 0
+
+loss:
+  history_size: 3
+  num_preds: 6
+  rollout_weight: 1.0
+  std_weight: 0.0
+
+data:
+  h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+  cache_dir: ~/.vitruvian/m4e_v4/cache
+  cache_mode: cls
+  model_id: facebook/dinov3-vitb16-pretrain-lvd1689m

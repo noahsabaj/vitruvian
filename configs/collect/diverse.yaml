@@ -1,0 +1,8 @@
+# M4.5 diverse-command grid (3×3×3 = 27 combos × 50 eps = 270k transitions).
+mode: diverse
+out_h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+episodes_per_command: 50
+episode_steps: 200
+chunk_size: 10
+seed: 0
+policy_ckpt: checkpoints/m1-g1-full/000043253760

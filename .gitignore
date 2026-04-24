@@ -8,8 +8,8 @@ __pycache__/
 # --- Virtual environments ---
 .venv/
 venv/
-env/
-ENV/
+/env/
+/ENV/
 
 # --- Build / packaging ---
 build/
@@ -61,8 +61,8 @@ logs/
 *.h5
 
 # --- Large data ---
-data/
-datasets/
+/data/
+/datasets/
 
 # --- Simulation / rendering outputs ---
 # (inline recordings in docs/ are fine; bulk outputs are not)

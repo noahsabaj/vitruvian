@@ -1,0 +1,65 @@
+# M4.6 JEPAv5 recipe: frozen DINOv3 + trainable patch head + PatchARPredictor.
+run_name: jepa_v5
+out_dir: ~/.vitruvian/jepa_v5
+
+jepa:
+  backbone:
+    name: dinov3-patch
+    kwargs:
+      model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+      spatial_stride: 2
+      freeze: true
+  patch_projector:
+    kwargs:
+      in_dim: 768
+      out_dim: 256
+  proprio_encoder:
+    kwargs:
+      in_dim: 103
+      hidden: 256
+      out_dim: 256
+      norm_fn: null
+  action_encoder:
+    kwargs:
+      action_dim: 29
+      frameskip: 1
+      smoothed_dim: 10
+      emb_dim: 256
+  predictor:
+    name: patch-ar
+    kwargs:
+      num_frames: 3
+      depth: 6
+      heads: 8
+      mlp_dim: 1024
+      input_dim: 256
+      hidden_dim: 256
+      output_dim: 256
+      dim_head: 32
+      dropout: 0.1
+      adaln_rank: 128
+
+trainer:
+  epochs: 3
+  batch_size: 16
+  lr: 1.0e-4
+  lr_floor: 3.0e-5
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  bf16: true
+  compile_predictor: true
+  num_workers: 4
+  val_frac: 0.05
+  seed: 0
+
+loss:
+  history_size: 3
+  num_preds: 6
+  rollout_weight: 1.0
+  std_weight: 1.0
+
+data:
+  h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+  cache_dir: ~/.vitruvian/m4f_v5/cache
+  cache_mode: patch2
+  model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
