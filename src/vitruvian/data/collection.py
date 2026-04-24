@@ -139,7 +139,10 @@ def diverse_config(out_h5: Path, **overrides) -> CollectionConfig:
 
 
 def run_collection(
-    cfg: CollectionConfig, *, single_process: bool = False
+    cfg: CollectionConfig,
+    *,
+    single_process: bool = False,
+    allow_partial: bool = False,
 ) -> None:
     """Run the full collection described by ``cfg``.
 
@@ -148,6 +151,14 @@ def run_collection(
     allocator releases between chunks. Use ``single_process=True`` only
     when the total episode count is small enough to fit in a single
     process (empirically < 20 eps on an 8 GB GPU).
+
+    With ``allow_partial=False`` (default), any chunk subprocess
+    returning a non-zero exit code causes ``run_collection`` to raise
+    after the merge step — the run still produces an HDF5 from the
+    surviving chunks, but the failure is not silently swallowed.
+    Pass ``allow_partial=True`` to accept a partial dataset without
+    raising (useful when you're rerunning and only want to complete
+    whatever works on this pass).
     """
     out = Path(cfg.out_h5).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +179,7 @@ def run_collection(
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_files: list[Path] = []
+    failed_commands: list[tuple[int, CommandSpec]] = []
     global_chunk_id = 0
     total_wall = 0.0
     failed = 0
@@ -219,6 +231,7 @@ def run_collection(
             if rc != 0:
                 print(f"  FAILED (rc={rc}) in {wall:.1f}s — skipping chunk")
                 failed += 1
+                failed_commands.append((global_chunk_id, cmd))
                 if chunk_file.exists():
                     chunk_file.unlink()
             else:
@@ -246,6 +259,18 @@ def run_collection(
         f"[collect] done: wall {total_wall:.1f}s  "
         f"→ {out.name} ({size_gb:.2f} GB)"
     )
+
+    if failed > 0 and not allow_partial:
+        cmd_summary = ", ".join(
+            f"[chunk {cid}: vx={c.vel_x:+.1f},vy={c.vel_y:+.1f},yr={c.yaw_rate:+.1f}]"
+            for cid, c in failed_commands
+        )
+        raise RuntimeError(
+            f"collect: {failed}/{failed + len(chunk_files)} chunks failed. "
+            f"Dataset at {out} is partial. Failed: {cmd_summary}. "
+            f"Rerun the collection to retry, or pass allow_partial=True to "
+            f"accept this as a partial dataset."
+        )
 
 
 def _spawn_worker(

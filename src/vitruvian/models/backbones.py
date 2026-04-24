@@ -329,6 +329,11 @@ def load_lewm_jepa_from_checkpoint(
 ) -> nn.Module:
     """Rebuild a standalone LeWM-shaped JEPA from a Lightning checkpoint.
 
+    Dedicated loader for the legacy v3 checkpoints that predate the
+    unified schema. M4.5+ v4/v5 checkpoints should go through
+    :func:`vitruvian.models.load_jepa` instead — it handles v4/v5
+    schemas with in-memory migration.
+
     Uses the vendored :mod:`vitruvian.lewm_compat` classes — no need
     for the ``external/le-wm/`` submodule to be on ``sys.path``.
     """

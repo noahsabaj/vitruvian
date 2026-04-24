@@ -4,14 +4,14 @@
 
 from vitruvian.utils.compile_utils import (
     bf16_autocast,
+    compile_and_warm,
     compile_model,
-    compiled_no_grad_forward,
 )
 from vitruvian.utils.config import load_config
 
 __all__ = [
     "bf16_autocast",
+    "compile_and_warm",
     "compile_model",
-    "compiled_no_grad_forward",
     "load_config",
 ]

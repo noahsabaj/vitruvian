@@ -30,7 +30,6 @@ from vitruvian.models.backbones import (
     DEFAULT_DINOV3_ID,
     DINOv3ClsBackbone,
     DINOv3PatchBackbone,
-    LeWMBackbone,
 )
 from vitruvian.models.jepa import JEPA
 from vitruvian.models.predictors import ARPredictor, PatchARPredictor
@@ -38,7 +37,10 @@ from vitruvian.models.predictors import ARPredictor, PatchARPredictor
 BACKBONES: dict[str, type[Backbone]] = {
     "dinov3-cls": DINOv3ClsBackbone,
     "dinov3-patch": DINOv3PatchBackbone,
-    "lewm-v3": LeWMBackbone,
+    # Note: ``LeWMBackbone`` is intentionally NOT in this registry. It
+    # wraps a pre-constructed LeWM JEPA object and cannot be built from
+    # YAML kwargs — load legacy v3 checkpoints through
+    # ``vitruvian.models.load_lewm_jepa_from_checkpoint`` directly.
 }
 PREDICTORS: dict[str, type[nn.Module]] = {
     "ar": ARPredictor,
@@ -298,15 +300,22 @@ def load_jepa(
     *,
     device: str = "cuda",
 ) -> JEPA:
-    """Load a :class:`JEPA` from any supported checkpoint format.
+    """Load a :class:`JEPA` from a unified-schema or legacy v4/v5 checkpoint.
 
     Supports:
 
     * **Unified** checkpoints (``config`` is already in the new schema).
-    * **Legacy v4** checkpoints from
-      ``scripts/m4e_train_jepa_v4.py`` — auto-migrated in memory.
-    * **Legacy v5** checkpoints from
-      ``scripts/m4f_train_jepa_v5.py`` — auto-migrated in memory.
+    * **Legacy v4** checkpoints (config carries ``dinov3_model_id`` +
+      ``predictor_mlp_dim`` but no ``spatial_stride``) — migrated in
+      memory to the unified schema.
+    * **Legacy v5** checkpoints (config carries ``spatial_stride`` or
+      ``predictor_hidden``) — migrated in memory; ``patch_proj.*``
+      state_dict keys re-homed to ``patch_projector.*``.
+
+    **Does NOT handle v3 LeWM Lightning checkpoints.** Those have a
+    different schema (encoder.*, predictor.*, action_encoder.* with
+    their own hyperparameters) and a different composition class.
+    Load them via :func:`vitruvian.models.load_lewm_jepa_from_checkpoint`.
 
     The frozen backbone is reloaded from HuggingFace; its weights are
     not persisted in the checkpoint. ``backbone.*`` keys missing from

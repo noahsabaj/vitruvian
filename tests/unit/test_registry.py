@@ -10,6 +10,17 @@ import pytest
 import torch
 
 from vitruvian.models import JEPA, build_jepa, load_jepa
+from vitruvian.models.registry import BACKBONES
+
+
+def test_registry_excludes_lewm_v3() -> None:
+    """`lewm-v3` was removed from BACKBONES in M4.9.1 — it's a stub
+    (``LeWMBackbone`` takes a pre-constructed JEPA, can't be built from
+    YAML kwargs). Legacy v3 checkpoints load via
+    ``load_lewm_jepa_from_checkpoint`` directly.
+    """
+    assert "lewm-v3" not in BACKBONES
+    assert set(BACKBONES.keys()) == {"dinov3-cls", "dinov3-patch"}
 
 
 def test_unknown_backbone_raises(registry_with_fakes) -> None:

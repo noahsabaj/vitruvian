@@ -47,3 +47,9 @@ build-backend = "uv_build"
 venvPath = "."
 venv = ".venv"
 
+[tool.pytest.ini_options]
+# Scope pytest to our first-party tests only. Without this, bare
+# `pytest` would also collect the 96 vendor tests under
+# external/mujoco_menagerie/test/, which couples our CI to upstream.
+testpaths = ["tests"]
+

@@ -83,6 +83,29 @@ def prediction_loss(
 ) -> dict[str, torch.Tensor]:
     """Terver-recipe training loss for any JEPA shape.
 
+    Recipe (Terver et al. arXiv:2512.24497 eq. 5):
+
+    * **1-step teacher-forced MSE** — given context frames ``[0..T_hist-1]``
+      and actions at those frames, the predictor outputs a per-position
+      prediction. Under causal masking, output at position ``t`` depends
+      on inputs ``[0..t]``, and is trained against the next frame
+      ``emb[t+1]``. So the target is ``emb[:, 1:T_hist+1]``.
+    * **k-step rollout MSE** — k from 1 up to ``num_preds - 1``. The
+      rolling window advances one step per iteration: drop the oldest
+      frame, append the last prediction, recompute. The k-th rollout's
+      last-position output is compared to ``emb[T_hist + k - 1]`` — the
+      ground-truth frame one step ahead of the last rolling-window
+      position.
+
+    The upstream LeWM codebase uses ``tgt_emb = emb[:, n_preds:]``
+    instead of ``emb[:, 1:T_hist+1]``, effectively training the
+    predictor to do ``num_preds``-step extrapolation. Empirically that
+    still converges, but its rollout loop becomes misaligned with the
+    TF step (the rollout compares single-frame targets against
+    ``num_preds``-step predictions). M4.9.1 restores the clean
+    Terver recipe the docstring has been claiming all along. See the
+    M4.9.1 plan for the audit trail.
+
     Args:
         model: :class:`vitruvian.models.JEPA` or a legacy ``JEPAv4`` /
             ``JEPAv5`` — duck-typed to ``.proprio_encoder``,
@@ -112,7 +135,8 @@ def prediction_loss(
 
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds : n_preds + ctx_len]
+    # 1-step TF target: at each context position t, predict emb[t+1].
+    tgt_emb = emb[:, 1 : ctx_len + 1]
 
     pred_emb = model.predict(ctx_emb, ctx_act)
     pred_loss = (pred_emb - tgt_emb).pow(2).mean()

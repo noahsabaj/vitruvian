@@ -95,30 +95,36 @@ def bf16_autocast(enabled: bool = True):
         yield
 
 
-def compiled_no_grad_forward(
+def compile_and_warm(
     model: "nn.Module", *example_inputs
 ) -> "nn.Module":
-    """Special case: compile a model that will only be used for
-    inference, with gradients off. Useful for plan-time predictor
-    rollouts.
+    """Compile a model and (optionally) run one warmup call so the
+    first production invocation doesn't eat the torch.compile stall.
 
-    The returned module is wrapped so ``model(x)`` runs under
-    ``torch.no_grad`` + BF16 autocast, which together with
-    ``torch.compile`` give the tightest inference path.
+    **What this does:**
+      1. Wraps ``model`` in :func:`compile_model` with
+         ``mode="reduce-overhead", dynamic=True``.
+      2. If ``example_inputs`` is supplied, runs one call under
+         ``torch.no_grad() + bf16_autocast()`` to trigger the
+         compile.
+
+    **What this does NOT do:** the returned module is the bare
+    compiled module. Subsequent calls are unwrapped — the caller is
+    responsible for ``torch.no_grad()`` and/or ``bf16_autocast()`` at
+    every call site where those are appropriate.
+
+    (The function was previously named ``compiled_no_grad_forward``,
+    which wrongly implied those contexts were enforced on every call.)
     """
     compiled = compile_model(model, mode="reduce-overhead", dynamic=True)
-
-    # Trigger first compile with the example input if supplied so the
-    # caller's first real call doesn't eat a 30-second stall.
     if example_inputs:
         with torch.no_grad(), bf16_autocast():
             compiled(*example_inputs)
-
     return compiled
 
 
 __all__ = [
     "bf16_autocast",
     "compile_model",
-    "compiled_no_grad_forward",
+    "compile_and_warm",
 ]

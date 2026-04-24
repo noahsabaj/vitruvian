@@ -66,11 +66,23 @@ def main() -> None:
         help="Skip subprocess isolation between chunks. Only for small "
         "configs (< 20 eps total); larger runs will hit Warp VRAM creep.",
     )
+    ap.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Accept a partial dataset when some chunks fail. Without "
+        "this flag, any chunk subprocess returning a non-zero rc causes "
+        "the run to raise after the merge step (the surviving chunks "
+        "are still written to the output HDF5).",
+    )
     args = ap.parse_args()
 
     cfg_dict = load_config(args.config, overrides=args.override)
     cfg = _cfg_from_dict(cfg_dict)
-    run_collection(cfg, single_process=args.single_process)
+    run_collection(
+        cfg,
+        single_process=args.single_process,
+        allow_partial=args.allow_partial,
+    )
 
 
 if __name__ == "__main__":
