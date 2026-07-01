@@ -36,6 +36,7 @@ from vitruvian.planning import (
     EncoderHistory,
     MPPIPlanner,
     MSECost,
+    TestTimeAdapter,
     encode_goal,
 )
 from vitruvian.utils import bf16_autocast, compile_model, load_config
@@ -70,6 +71,7 @@ def _run_one(
     env_ctx: dict,
     jepa,
     planner_backbone,
+    adapter: TestTimeAdapter | None = None,
 ) -> RunResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pinned_cmd = env_ctx.get("pinned_cmd")
@@ -111,11 +113,28 @@ def _run_one(
     history = EncoderHistory(size=HS, encoder=planner_backbone.encode)
     action_hist: list[np.ndarray] = []
     rng_key = env_ctx["rng"]
+    # AdaJEPA: start each episode from the pretrained predictor (the adapter
+    # mutates jepa.predictor in place across macros within a run).
+    if adapter is not None:
+        adapter.reset()
 
     def _capture_frame() -> None:
         pix = render_head_cam(env_ctx)
         pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
         history.push(pix_chw)
+
+    def _encode_current() -> torch.Tensor:
+        # Encode the CURRENT (pre-step) head-cam obs WITHOUT touching the
+        # planner history — feeds the adapter aligned (f_t, a_t) pairs where
+        # a_t drives f_t -> f_{t+1} (no RC1-style off-by-one).
+        pix = render_head_cam(env_ctx)
+        pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
+        with torch.no_grad():
+            return (
+                planner_backbone.encode(pix_chw.unsqueeze(0).unsqueeze(0))
+                .squeeze(0)
+                .squeeze(0)
+            )
 
     cosines: list[float] = []
     per_macro: list[dict] = []
@@ -159,6 +178,10 @@ def _run_one(
         per_macro.append({"macro": macro_idx, "cos": cos})
 
         for step_i in range(planner.horizon):
+            # AdaJEPA: capture the pre-step obs + the action about to be
+            # applied (an aligned transition) for the last HS+1 steps.
+            if adapter is not None and step_i >= planner.horizon - (HS + 1):
+                adapter.push(_encode_current(), torch.from_numpy(U_np[step_i]))
             action = jnp.asarray(U_np[step_i], dtype=jnp.float32)
             env_ctx["state"] = env_ctx["step_fn"](env_ctx["state"], action)
             if pinned_cmd is not None:
@@ -174,6 +197,11 @@ def _run_one(
         if z < 0.3:
             walk_completed = False
             break
+
+        # AdaJEPA: one self-supervised gradient step on this macro's observed
+        # transition; the updated predictor drives the next macro's plan.
+        if adapter is not None:
+            adapter.step(n_steps=1)
 
     wall = time.perf_counter() - t0
     return RunResult(
@@ -196,6 +224,13 @@ def main() -> None:
     ap.add_argument("--policy-ckpt", type=Path, default=None)
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument(
+        "--adapt",
+        action="store_true",
+        help="AdaJEPA test-time adaptation: one self-supervised GD step on "
+        "the predictor per macro (per-episode reset). Run with and without "
+        "to measure the lift.",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides=args.override)
@@ -210,6 +245,11 @@ def main() -> None:
         jepa.predictor = compile_model(jepa.predictor, mode="reduce-overhead")
 
     planner_backbone = PlannerBackbone(jepa)
+    adapter = (
+        TestTimeAdapter(jepa, history_size=3, num_preds=1, buffer_size=4)
+        if args.adapt
+        else None
+    )
 
     policy_ckpt = args.policy_ckpt or (
         Path(cfg["policy_ckpt"]).expanduser()
@@ -243,7 +283,7 @@ def main() -> None:
         tf.write("scenario\th5\tgoal_ep\tsigma\tseed\tmean_cos\tcos_range\tmax_cos\twalk_completed\twall_s\n")
         for i, r_cfg in enumerate(runs_cfg, 1):
             print(f"[{i}/{len(runs_cfg)}] {r_cfg}")
-            res = _run_one(r_cfg, env_ctx, jepa, planner_backbone)
+            res = _run_one(r_cfg, env_ctx, jepa, planner_backbone, adapter)
             jf.write(json.dumps(asdict(res)) + "\n")
             tf.write(
                 f"{r_cfg.scenario}\t{r_cfg.h5_path}\t{r_cfg.goal_ep}\t"
