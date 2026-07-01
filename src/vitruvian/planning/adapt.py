@@ -120,8 +120,9 @@ class TestTimeAdapter:
         ``seq_len`` window. Returns the last loss value."""
         if len(self._emb) < self.seq_len:
             return None
-        emb = torch.stack(list(self._emb)[-self.seq_len :], dim=0).unsqueeze(0)
-        act = torch.stack(list(self._act)[-self.seq_len :], dim=0).unsqueeze(0)
+        dev = next(self.jepa.predictor.parameters()).device
+        emb = torch.stack(list(self._emb)[-self.seq_len :], dim=0).unsqueeze(0).to(dev)
+        act = torch.stack(list(self._act)[-self.seq_len :], dim=0).unsqueeze(0).to(dev)
         batch = {"emb": emb, "action": act}
         rollout_weight = 1.0 if self.num_preds >= 2 else 0.0
 
