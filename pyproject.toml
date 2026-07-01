@@ -40,6 +40,7 @@ vit-train = "vitruvian.cli.train:main"
 vit-plan = "vitruvian.cli.plan:main"
 vit-eval = "vitruvian.cli.eval:main"
 vit-collect = "vitruvian.cli.collect:main"
+vit-rollout = "vitruvian.cli.rollout:main"
 
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]

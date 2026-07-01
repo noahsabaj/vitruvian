@@ -1,0 +1,24 @@
+# Q1a — open-loop latent rollout accuracy on held-out episodes.
+#
+# Rolls the world model forward from `history_size` seed frames using the
+# episode's recorded actions and compares predicted vs ground-truth DINOv3
+# patch embeddings (projected into the predictor's latent) as a function of
+# horizon, against a persistence ("no-change") baseline. If the model does
+# not beat persistence at longer horizons, the world model is decorative.
+#
+# Reuses the same cache + episode-aware split as training, so the evaluated
+# episodes are exactly the held-out ones. No training; runs on the baseline.
+ckpt: ~/.vitruvian/jepa_v5/best.pt
+out_dir: ~/.vitruvian/jepa_v5/rollout_eval
+
+history_size: 3        # must match training loss.history_size
+train_seq_len: 9       # training seq_len (history_size + num_preds); for the held-out split
+val_frac: 0.05         # must match training trainer.val_frac
+seed: 0                # must match training trainer.seed
+max_horizon: 16        # probe past the training horizon (num_preds=6) to expose compounding
+
+data:
+  h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+  cache_dir: ~/.vitruvian/m4f_v5/cache
+  cache_mode: patch2
+  model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
