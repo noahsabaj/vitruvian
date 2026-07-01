@@ -133,7 +133,9 @@ class DINOv3ClsBackbone(nn.Module):
         elif pixels.dtype != torch.float32 and pixels.dtype != torch.float16:
             pixels = pixels.float()
         pixels = self._normalize(pixels)
-        return pixels.to(self.dtype)
+        # Move to the encoder's device too — callers (goal image, head-cam
+        # frames) often pass CPU tensors; a no-op when already on-device.
+        return pixels.to(self.device_str, self.dtype)
 
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
         """Encode pixel frames → flat CLS embeddings.
@@ -276,7 +278,9 @@ class DINOv3PatchBackbone(nn.Module):
         elif pixels.dtype not in (torch.float32, torch.float16):
             pixels = pixels.float()
         pixels = self._normalize(pixels)
-        return pixels.to(self.dtype)
+        # Move to the encoder's device too — callers (goal image, head-cam
+        # frames) often pass CPU tensors; a no-op when already on-device.
+        return pixels.to(self.device_str, self.dtype)
 
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
         """Encode pixel frames → stride-subsampled patch tokens.
