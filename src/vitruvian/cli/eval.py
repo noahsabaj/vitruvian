@@ -72,6 +72,7 @@ def _run_one(
     jepa,
     planner_backbone,
     adapter: TestTimeAdapter | None = None,
+    adapt_steps: int = 1,
 ) -> RunResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pinned_cmd = env_ctx.get("pinned_cmd")
@@ -201,7 +202,7 @@ def _run_one(
         # AdaJEPA: one self-supervised gradient step on this macro's observed
         # transition; the updated predictor drives the next macro's plan.
         if adapter is not None:
-            adapter.step(n_steps=1)
+            adapter.step(n_steps=adapt_steps)
 
     wall = time.perf_counter() - t0
     return RunResult(
@@ -230,6 +231,13 @@ def main() -> None:
         help="AdaJEPA test-time adaptation: one self-supervised GD step on "
         "the predictor per macro (per-episode reset). Run with and without "
         "to measure the lift.",
+    )
+    ap.add_argument(
+        "--adapt-steps",
+        type=int,
+        default=1,
+        help="GD steps per macro when --adapt (AdaJEPA default 1; higher "
+        "tests whether stronger adaptation amplifies the lift or overshoots).",
     )
     args = ap.parse_args()
 
@@ -283,7 +291,9 @@ def main() -> None:
         tf.write("scenario\th5\tgoal_ep\tsigma\tseed\tmean_cos\tcos_range\tmax_cos\twalk_completed\twall_s\n")
         for i, r_cfg in enumerate(runs_cfg, 1):
             print(f"[{i}/{len(runs_cfg)}] {r_cfg}")
-            res = _run_one(r_cfg, env_ctx, jepa, planner_backbone, adapter)
+            res = _run_one(
+                r_cfg, env_ctx, jepa, planner_backbone, adapter, args.adapt_steps
+            )
             jf.write(json.dumps(asdict(res)) + "\n")
             tf.write(
                 f"{r_cfg.scenario}\t{r_cfg.h5_path}\t{r_cfg.goal_ep}\t"
