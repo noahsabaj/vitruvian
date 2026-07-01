@@ -18,6 +18,7 @@ from vitruvian.data.datasets import (
     G1EmbSeqDataset,
     G1HERTransitionDataset,
     G1PatchSeqDataset,
+    episode_aware_split,
 )
 from vitruvian.data.precompute import build_cls_cache, build_patch_cache
 
@@ -35,6 +36,7 @@ __all__ = [
     "build_patch_cache",
     "collect_chunk",
     "diverse_config",
+    "episode_aware_split",
     "merge_hdf5_chunks_streaming",
     "narrow_config",
     "run_collection",

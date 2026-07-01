@@ -65,7 +65,7 @@ def test_train_plan_roundtrip(
     loss_fn = partial(
         prediction_loss,
         history_size=3, num_preds=3,
-        rollout_weight=1.0, std_weight=1.0,
+        rollout_weight=1.0, reg_weight=1.0,
     )
     trainer_cfg = TrainerConfig(
         epochs=1, batch_size=4, lr=1e-3, lr_floor=1e-4, warmup_steps=1,

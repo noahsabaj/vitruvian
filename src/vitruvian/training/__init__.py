@@ -9,7 +9,11 @@ from vitruvian.training.iql import (
     ema_update,
     expectile_loss,
 )
-from vitruvian.training.losses import prediction_loss, vicreg_std_loss
+from vitruvian.training.losses import (
+    prediction_loss,
+    sigreg_loss,
+    vicreg_std_loss,
+)
 from vitruvian.training.trainer import JEPATrainer, TrainerConfig, cosine_lr_factor
 
 __all__ = [
@@ -22,5 +26,6 @@ __all__ = [
     "ema_update",
     "expectile_loss",
     "prediction_loss",
+    "sigreg_loss",
     "vicreg_std_loss",
 ]

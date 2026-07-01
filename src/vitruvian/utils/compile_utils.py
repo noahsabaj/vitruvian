@@ -22,11 +22,15 @@ change.
 
 **Footguns this module handles:**
 
-  * ``torch.compile`` plus dynamic shapes (e.g., MPPI rollouts whose
-    sequence grows each iteration) can recompile forever. We set
-    ``dynamic=True`` as the default and document when callers should
-    override it (fixed-shape predictor forwards → ``dynamic=False``
-    for a faster first-step compile).
+  * The same compiled module sees several batch sizes across the
+    project — precompute streams in ``batch_size`` chunks with a ragged
+    final chunk, training uses a different batch size, and the planner
+    rolls out ``num_samples`` candidates. A static compile would
+    re-trace on each new leading dim; we set ``dynamic=True`` as the
+    default so one trace serves them all. Override to ``dynamic=False``
+    only when every call is guaranteed the same shape (faster first
+    compile). Note the predictor's *sequence* length is NOT dynamic —
+    the rollout truncates to ``history_size`` before each step.
   * Some ops don't have BF16 kernels (uncommon in pure transformers;
     rare in our use). Autocast falls back to FP32 silently.
 """

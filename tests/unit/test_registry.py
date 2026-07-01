@@ -92,7 +92,10 @@ def test_v5_legacy_ckpt_migration(
     ckpt_path = tmp_path / "legacy_v5.pt"
     torch.save({"config": cfg_v5, "state_dict": legacy_sd}, ckpt_path)
 
-    loaded = load_jepa(ckpt_path, device="cpu")
+    # Legacy checkpoint (no arch_version) → load_jepa warns a retrain is
+    # needed, but still loads for schema-migration verification.
+    with pytest.warns(UserWarning, match="arch_version"):
+        loaded = load_jepa(ckpt_path, device="cpu")
     new_sd = loaded.state_dict()
     for k, v in sd.items():
         if k.startswith("backbone."):

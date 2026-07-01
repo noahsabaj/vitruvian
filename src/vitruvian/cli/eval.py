@@ -32,7 +32,12 @@ from vitruvian.env import (
     rollout_policy_warm_start,
 )
 from vitruvian.models import PlannerBackbone, load_jepa
-from vitruvian.planning import EncoderHistory, MPPIPlanner, MSECost, encode_goal
+from vitruvian.planning import (
+    EncoderHistory,
+    MPPIPlanner,
+    MSECost,
+    encode_goal,
+)
 from vitruvian.utils import bf16_autocast, compile_model, load_config
 
 
@@ -67,17 +72,26 @@ def _run_one(
     planner_backbone,
 ) -> RunResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    pinned_cmd = env_ctx.get("pinned_cmd")
 
-    # Fresh env reset for this run.
+    # Fresh env reset for this run. Pin the eval command into the state so
+    # the rollout actually runs under ``vel_cmd`` (the env otherwise keeps
+    # the random reset command).
     rng = jax.random.PRNGKey(cfg.seed)
     rng, rkey = jax.random.split(rng)
-    env_ctx["state"] = env_ctx["reset_fn"](rkey)
+    state = env_ctx["reset_fn"](rkey)
+    if pinned_cmd is not None:
+        state = state.replace(info={**state.info, "command": pinned_cmd})
+    env_ctx["state"] = state
     env_ctx["rng"] = rng
 
-    with bf16_autocast():
+    with bf16_autocast(), torch.no_grad():
         goal_pixel = torch.from_numpy(
             load_goal_pixel(Path(cfg.h5_path), 0, cfg.goal_ep)
         )
+        # Plain visual goal embedding — the world-model target is
+        # visual-only, so the planner cost and this cosine diagnostic
+        # both live in that one space.
         goal_emb = encode_goal(planner_backbone, goal_pixel).to(device)
 
     planner = MPPIPlanner(
@@ -93,9 +107,15 @@ def _run_one(
         history_size=3,
         device=device,
     )
-    history = EncoderHistory(size=3, encoder=planner_backbone.encode)
+    HS = planner.history_size
+    history = EncoderHistory(size=HS, encoder=planner_backbone.encode)
     action_hist: list[np.ndarray] = []
     rng_key = env_ctx["rng"]
+
+    def _capture_frame() -> None:
+        pix = render_head_cam(env_ctx)
+        pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
+        history.push(pix_chw)
 
     cosines: list[float] = []
     per_macro: list[dict] = []
@@ -103,15 +123,16 @@ def _run_one(
     t0 = time.perf_counter()
 
     for macro_idx in range(cfg.n_macros):
-        pix = render_head_cam(env_ctx)
-        pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
-        curr_emb = history.push(pix_chw)
+        # Seed macro 0; later macros inherit a consecutive HS-frame window
+        # from the previous macro's tail captures below.
+        if len(history) == 0:
+            _capture_frame()
 
         warm_U, rng_key = rollout_policy_warm_start(
             env_ctx, planner.horizon, rng_key
         )
         ah = (
-            np.stack(action_hist[-3:], axis=0)
+            np.stack(action_hist[-HS:], axis=0)
             if action_hist
             else np.zeros((1, 29), dtype=np.float32)
         )
@@ -126,8 +147,9 @@ def _run_one(
             )
         U_np = U.detach().cpu().numpy()
 
-        # Cosine between current CLS/patch-mean and goal.
-        cur_flat = curr_emb.flatten().float()
+        # Cosine between the current visual latent and the goal — a
+        # logged diagnostic in the same visual space.
+        cur_flat = history.latest().flatten().float()
         goal_flat = goal_emb.flatten().float()
         cos = float(
             (cur_flat * goal_flat).sum()
@@ -139,7 +161,13 @@ def _run_one(
         for step_i in range(planner.horizon):
             action = jnp.asarray(U_np[step_i], dtype=jnp.float32)
             env_ctx["state"] = env_ctx["step_fn"](env_ctx["state"], action)
+            if pinned_cmd is not None:
+                env_ctx["state"] = env_ctx["state"].replace(
+                    info={**env_ctx["state"].info, "command": pinned_cmd}
+                )
             action_hist.append(U_np[step_i])
+            if step_i >= planner.horizon - HS:
+                _capture_frame()
 
         # Safety — if the robot falls mid-walk (torso z < 0.3m) abort.
         z = float(get_torso_xyz(env_ctx)[2])

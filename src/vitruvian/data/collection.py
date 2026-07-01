@@ -143,6 +143,7 @@ def run_collection(
     *,
     single_process: bool = False,
     allow_partial: bool = False,
+    max_workers: int = 1,
 ) -> None:
     """Run the full collection described by ``cfg``.
 
@@ -151,6 +152,15 @@ def run_collection(
     allocator releases between chunks. Use ``single_process=True`` only
     when the total episode count is small enough to fit in a single
     process (empirically < 20 eps on an 8 GB GPU).
+
+    ``max_workers`` (default 1 = the historical serial behavior) runs up
+    to that many chunk subprocesses CONCURRENTLY. Each chunk is already a
+    GPU-isolated subprocess (Warp's allocator resets between chunks), so
+    concurrency is bounded by GPU memory, not correctness — set it high
+    on a big card (~16–24 on 96 GB), low on 8 GB (~2–3). This is the main
+    collection speed lever: collection is otherwise a single serial
+    per-step render loop, so wall-time scales ~1/workers. Ignored when
+    ``single_process=True`` (in-process runs can't be GPU-isolated).
 
     With ``allow_partial=False`` (default), any chunk subprocess
     returning a non-zero exit code causes ``run_collection`` to raise
@@ -178,12 +188,10 @@ def run_collection(
     chunk_dir = out.parent / f".{out.stem}_chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    chunk_files: list[Path] = []
-    failed_commands: list[tuple[int, CommandSpec]] = []
-    global_chunk_id = 0
-    total_wall = 0.0
-    failed = 0
-
+    # Build the full chunk work-list, then execute it (serially, or up to
+    # ``max_workers`` GPU-isolated subprocesses at once).
+    specs: list[tuple[int, int, CommandSpec, Path, int, int]] = []
+    gid = 0
     for cmd_idx, cmd in enumerate(cfg.commands):
         for chunk_idx in range(chunks_per_combo):
             start_ep = chunk_idx * cfg.chunk_size
@@ -193,51 +201,66 @@ def run_collection(
             if this_chunk <= 0:
                 continue
             chunk_file = chunk_dir / (
-                f"chunk_{global_chunk_id:04d}_cmd{cmd_idx:02d}"
+                f"chunk_{gid:04d}_cmd{cmd_idx:02d}"
                 f"_vx{cmd.vel_x:+.1f}_vy{cmd.vel_y:+.1f}"
                 f"_yr{cmd.yaw_rate:+.1f}.h5"
             )
-            chunk_seed = cfg.seed + global_chunk_id * 1000
-            print(
-                f"[chunk {global_chunk_id + 1:>4}/"
-                f"{chunks_per_combo * len(cfg.commands)}]  "
-                f"cmd=({cmd.vel_x:+.2f},{cmd.vel_y:+.2f},{cmd.yaw_rate:+.2f})  "
-                f"eps={this_chunk}  seed={chunk_seed}"
+            specs.append(
+                (gid, cmd_idx, cmd, chunk_file, cfg.seed + gid * 1000, this_chunk)
             )
-            t0 = time.perf_counter()
-            if single_process:
-                collect_chunk(
-                    n_episodes=this_chunk,
-                    episode_steps=cfg.episode_steps,
-                    img_size=cfg.img_size,
-                    out=chunk_file,
-                    seed=chunk_seed,
-                    policy_ckpt=cfg.policy_ckpt,
-                    command=cmd,
-                )
-                rc = 0
-            else:
-                rc = _spawn_worker(
-                    n_episodes=this_chunk,
-                    episode_steps=cfg.episode_steps,
-                    img_size=cfg.img_size,
-                    out=chunk_file,
-                    seed=chunk_seed,
-                    policy_ckpt=cfg.policy_ckpt,
-                    command=cmd,
-                )
-            wall = time.perf_counter() - t0
-            total_wall += wall
-            if rc != 0:
-                print(f"  FAILED (rc={rc}) in {wall:.1f}s — skipping chunk")
-                failed += 1
-                failed_commands.append((global_chunk_id, cmd))
-                if chunk_file.exists():
-                    chunk_file.unlink()
-            else:
-                print(f"  done in {wall:.1f}s")
-                chunk_files.append(chunk_file)
-            global_chunk_id += 1
+            gid += 1
+
+    n_chunks = len(specs)
+    chunk_files: list[Path] = []
+    failed_commands: list[tuple[int, CommandSpec]] = []
+    failed = 0
+    workers = 1 if single_process else max(1, int(max_workers))
+    print(
+        f"[collect] {n_chunks} chunk(s) × {cfg.chunk_size} eps  "
+        f"({workers} concurrent worker(s))"
+    )
+    t_start = time.perf_counter()
+
+    def _run_one(spec: tuple) -> tuple[tuple, int]:
+        _gid, _cmd_idx, cmd, chunk_file, chunk_seed, this_chunk = spec
+        if single_process:
+            collect_chunk(
+                n_episodes=this_chunk, episode_steps=cfg.episode_steps,
+                img_size=cfg.img_size, out=chunk_file, seed=chunk_seed,
+                policy_ckpt=cfg.policy_ckpt, command=cmd,
+            )
+            return spec, 0
+        rc = _spawn_worker(
+            n_episodes=this_chunk, episode_steps=cfg.episode_steps,
+            img_size=cfg.img_size, out=chunk_file, seed=chunk_seed,
+            policy_ckpt=cfg.policy_ckpt, command=cmd,
+        )
+        return spec, rc
+
+    def _handle(spec: tuple, rc: int) -> None:
+        nonlocal failed
+        _gid, _cmd_idx, cmd, chunk_file, _seed, _n = spec
+        if rc != 0:
+            print(f"  [chunk {_gid + 1}/{n_chunks}] FAILED (rc={rc}) — skipping")
+            failed += 1
+            failed_commands.append((_gid, cmd))
+            if chunk_file.exists():
+                chunk_file.unlink()
+        else:
+            print(f"  [chunk {_gid + 1}/{n_chunks}] done")
+            chunk_files.append(chunk_file)
+
+    if workers == 1:
+        for spec in specs:
+            _handle(*_run_one(spec))
+    else:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_run_one, s) for s in specs]
+            for fut in concurrent.futures.as_completed(futs):
+                _handle(*fut.result())
+    total_wall = time.perf_counter() - t_start
 
     if not chunk_files:
         raise RuntimeError("All chunks failed; nothing to merge.")
@@ -321,10 +344,14 @@ def merge_hdf5_chunks_streaming(
     chunk_files: list[Path], out: Path
 ) -> None:
     """Two-pass streaming merge. Pass 1: read per-chunk shapes/metadata.
-    Pass 2: preallocate output datasets, copy rows chunk-by-chunk.
+    Pass 2: preallocate output datasets, copy one whole chunk file at a
+    time into the output slab.
 
-    Host RAM footprint is bounded by HDF5's own chunk cache, not the
-    slab size — essential for the 40 GB diverse dataset.
+    Host RAM stays bounded by the largest single chunk file (each chunk
+    is read via ``fin["pixels"][:]`` and copied straight into the output
+    dataset), not by the full merged size — essential for the 40 GB
+    diverse set, which would OOM a 32 GB box if concatenated in RAM.
+    Keep ``chunk_size`` modest so a chunk file fits comfortably.
     """
     import h5py
     import numpy as np

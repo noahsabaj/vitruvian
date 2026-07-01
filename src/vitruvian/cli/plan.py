@@ -86,13 +86,13 @@ def main() -> None:
             info={**env_ctx["state"].info, "command": env_ctx["pinned_cmd"]}
         )
 
-    # Build goal embedding.
+    # Build goal embedding — a plain visual embedding. The world model's
+    # target is visual-only (proprio is train-time conditioning), so the
+    # goal and the MPPI cost live in the same clean visual space.
     h5 = args.h5 or Path(cfg["h5"]).expanduser()
     goal_ep = args.goal_ep if args.goal_ep is not None else int(cfg["goal_ep"])
-    goal_pixel = torch.from_numpy(
-        load_goal_pixel(h5, args.goal_idx, goal_ep)
-    )
-    with bf16_autocast():
+    goal_pixel = torch.from_numpy(load_goal_pixel(h5, args.goal_idx, goal_ep))
+    with bf16_autocast(), torch.no_grad():
         goal_emb = encode_goal(planner_backbone, goal_pixel).to(device)
 
     # Build planner.
@@ -112,12 +112,18 @@ def main() -> None:
         device=device,
     )
 
-    # Encode-once history.
-    history = EncoderHistory(
-        size=int(plan_cfg.get("history_size", 3)),
-        encoder=planner_backbone.encode,
-    )
+    # Encode-once history. The world model is per-step, so the history
+    # must be the last HS *consecutive* frames (matching training), not
+    # one stale frame per macro.
+    HS = planner.history_size
+    history = EncoderHistory(size=HS, encoder=planner_backbone.encode)
     action_hist: list[np.ndarray] = []
+
+    def _capture_frame() -> None:
+        """Encode + retain the current head-cam frame (visual-only)."""
+        pix = render_head_cam(env_ctx)
+        pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
+        history.push(pix_chw)
 
     n_macros = int(cfg.get("n_macros", 10))
     frames: list[np.ndarray] = []
@@ -125,15 +131,17 @@ def main() -> None:
     t0 = time.perf_counter()
 
     for macro_idx in range(n_macros):
-        pix = render_head_cam(env_ctx)
-        pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
-        history.push(pix_chw)
+        # Macro 0 has no prior frames — seed with the current one. Later
+        # macros inherit a full HS-frame window from the previous macro's
+        # tail captures below.
+        if len(history) == 0:
+            _capture_frame()
 
         warm_U, rng_key = rollout_policy_warm_start(
             env_ctx, planner.horizon, rng_key
         )
         ah = (
-            np.stack(action_hist[-planner.history_size :], axis=0)
+            np.stack(action_hist[-HS:], axis=0)
             if action_hist
             else np.zeros((1, planner.action_dim), dtype=np.float32)
         )
@@ -161,6 +169,10 @@ def main() -> None:
                     }
                 )
             action_hist.append(U_np[step_i])
+            # Capture the last HS frames of this macro so the next plan
+            # sees a consecutive HS-frame history.
+            if step_i >= planner.horizon - HS:
+                _capture_frame()
             if args.video_out is not None:
                 frames.append(render_multi_cam(env_ctx))
 

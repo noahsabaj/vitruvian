@@ -28,6 +28,7 @@ from vitruvian.data import (
     G1PatchSeqDataset,
     build_cls_cache,
     build_patch_cache,
+    episode_aware_split,
 )
 from vitruvian.models import build_jepa
 from vitruvian.training import JEPATrainer, TrainerConfig, prediction_loss
@@ -117,19 +118,25 @@ def _build_loaders(
         if cache_mode.startswith("patch")
         else G1EmbSeqDataset(h5_path, cache.tensor, seq_len=seq_len)
     )
+
+    # Episode-aware split. Sliding windows from one episode overlap by
+    # seq_len-1 frames, so a per-window random_split leaks frames across
+    # train/val and inflates val_pred_loss (used for model selection).
+    # Splitting by whole episode keeps the two sets frame-disjoint.
+    train_idx, val_idx = episode_aware_split(
+        dataset.ep_offset, dataset.valid_idx,
+        val_frac=trainer_cfg.val_frac, seed=trainer_cfg.seed, seq_len=seq_len,
+    )
+
     subsample = int(data_cfg.get("subsample", 0) or 0)
     if quick and subsample == 0:
         subsample = 2000
     if subsample > 0:
-        dataset = Subset(dataset, list(range(min(subsample, len(dataset)))))
+        train_idx = train_idx[:subsample]
+        val_idx = val_idx[: max(1, int(round(trainer_cfg.val_frac * subsample)))]
 
-    rnd = torch.Generator().manual_seed(trainer_cfg.seed)
-    n_total = len(dataset)
-    n_val = max(1, int(trainer_cfg.val_frac * n_total))
-    n_train = n_total - n_val
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [n_train, n_val], generator=rnd
-    )
+    train_set = Subset(dataset, train_idx)
+    val_set = Subset(dataset, val_idx)
 
     nw = trainer_cfg.num_workers if not quick else 0
     train_loader = DataLoader(
@@ -192,7 +199,14 @@ def main() -> None:
     history_size = int(loss_cfg.get("history_size", 3))
     num_preds = int(loss_cfg.get("num_preds", 6))
     rollout_weight = float(loss_cfg.get("rollout_weight", 1.0))
-    std_weight = float(loss_cfg.get("std_weight", 0.0))
+    # ``reg_weight`` weights the SIGReg isotropic-Gaussian term; accept
+    # the legacy ``std_weight`` key as an alias.
+    reg_weight = float(
+        loss_cfg.get("reg_weight", loss_cfg.get("std_weight", 0.0))
+    )
+    # Per-frame proprio-conditioning dropout so the model tolerates the
+    # proprio-free future of a plan-time rollout.
+    proprio_dropout = float(loss_cfg.get("proprio_dropout", 0.5))
     seq_len = history_size + num_preds
 
     train_loader, val_loader = _build_loaders(
@@ -202,17 +216,14 @@ def main() -> None:
         quick=args.quick_debug,
     )
 
-    # Build JEPA. For patch training we skip the backbone weight load —
-    # the cache already has the patches.
+    # Build JEPA. Training reads the precomputed embedding cache, so the
+    # backbone forward is never called — load it lazily (both cls and
+    # patch) to free the ~344 MB of DINOv3 VRAM for the trainable
+    # predictor. ``vit-plan``/``vit-eval`` hydrate it via load_eagerly().
     jepa_cfg = cfg["jepa"]
-    if cache_mode.startswith("patch"):
-        jepa_cfg.setdefault("backbone", {}).setdefault("kwargs", {}).update(
-            {"lazy": True, "device": device}
-        )
-    else:
-        jepa_cfg.setdefault("backbone", {}).setdefault("kwargs", {})[
-            "device"
-        ] = device
+    jepa_cfg.setdefault("backbone", {}).setdefault("kwargs", {}).update(
+        {"lazy": True, "device": device}
+    )
     jepa = build_jepa(jepa_cfg).to(device)
 
     loss_fn = partial(
@@ -220,7 +231,8 @@ def main() -> None:
         history_size=history_size,
         num_preds=num_preds,
         rollout_weight=rollout_weight,
-        std_weight=std_weight,
+        reg_weight=reg_weight,
+        proprio_dropout=proprio_dropout,
     )
 
     run_name = args.run_name or cfg.get("run_name", "jepa")

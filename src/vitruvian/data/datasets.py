@@ -134,6 +134,8 @@ class G1PatchSeqDataset(Dataset[dict[str, Any]]):
             f"patch cache rows {patch_cache.shape[0]} != H5 rows {n_total}"
         )
         self.patches = patch_cache
+        self.ep_offset = ep_offset
+        self.ep_len = ep_len
         self.valid_idx = _valid_seq_starts(ep_offset, ep_len, self.seq_len)
 
     def __len__(self) -> int:
@@ -156,16 +158,27 @@ class G1HERTransitionDataset(Dataset[dict[str, Any]]):
     ``g ∈ [t+1, ep_end)`` uniformly at random. This gives the IQL loss
     genuine goal-reaching structure (cross-trajectory goals don't).
 
+    ``is_goal_reached`` flags the transitions whose *next* state is the
+    sampled goal (``t + 1 == g``). These are the terminal transitions of
+    the relabeled goal-reaching MDP: the consumer (:class:`~vitruvian.
+    training.iql.VFHERTrainer`) gives them the ``reward_self_loop``
+    reward and drops the bootstrap, which is what grounds the value
+    head's ``V(g, g) ≈ 0`` anchor. Sampling from ``[t+1, ep_end)``
+    guarantees a non-empty set of such transitions (the last in-episode
+    pair always has ``g == t + 1``). The earlier ``is_goal_self =
+    (t == g)`` flag was dead — ``g`` is never ``t`` — so no transition
+    was ever terminal and the value target degenerated to a constant.
+
     Yields per-sample dicts::
 
         {
-          "emb_t":        (D_emb,) float32,
-          "prop_t":       (D_prop,) float32,
-          "emb_tp1":      (D_emb,) float32,
-          "prop_tp1":     (D_prop,) float32,
-          "emb_g":        (D_emb,) float32,
-          "prop_g":       (D_prop,) float32,
-          "is_goal_self": bool tensor (t == g),
+          "emb_t":          (D_emb,) float32,
+          "prop_t":         (D_prop,) float32,
+          "emb_tp1":        (D_emb,) float32,
+          "prop_tp1":       (D_prop,) float32,
+          "emb_g":          (D_emb,) float32,
+          "prop_g":         (D_prop,) float32,
+          "is_goal_reached": bool tensor (t + 1 == g),
         }
     """
 
@@ -211,12 +224,82 @@ class G1HERTransitionDataset(Dataset[dict[str, Any]]):
             "prop_tp1": self.proprio[t + 1],
             "emb_g": self.emb[g],
             "prop_g": self.proprio[g],
-            "is_goal_self": torch.tensor(t == g, dtype=torch.bool),
+            # Terminal transition of the relabeled MDP: the next state is
+            # the goal. ``g`` is sampled from ``[t+1, ep_end)``, so this
+            # is the achievable "goal reached" event (``t == g`` never is).
+            "is_goal_reached": torch.tensor(t + 1 == g, dtype=torch.bool),
         }
+
+
+def episode_aware_split(
+    ep_offset: np.ndarray,
+    valid_idx: np.ndarray,
+    *,
+    val_frac: float,
+    seed: int,
+    seq_len: int,
+) -> tuple[list[int], list[int]]:
+    """Split window indices into ``(train, val)`` WITHOUT frame leakage.
+
+    Sliding windows from the same episode overlap by ``seq_len - 1``
+    frames, so a per-window random split (``random_split``) scatters
+    near-duplicate windows across train and val and inflates the
+    validation metric. This splits by *whole episode* instead — every
+    window of an episode goes to the same side — so no frame is shared.
+
+    Episodes are shuffled with ``seed`` and assigned to val until about
+    ``val_frac`` of the windows are covered, always leaving at least one
+    episode for train (and one window for val). With a single episode it
+    falls back to a contiguous split with a ``seq_len`` gap, so the two
+    halves still share no frame.
+
+    Args:
+        ep_offset: ``(n_episodes,)`` per-episode start row (ascending).
+        valid_idx: ``(n_windows,)`` window-start rows, as built by the
+            dataset (sorted; each window lies within one episode).
+        val_frac: target fraction of windows for validation.
+        seed: RNG seed for episode shuffling.
+        seq_len: window length (used for the single-episode gap).
+
+    Returns:
+        ``(train_idx, val_idx)`` — lists of indices into ``valid_idx``.
+    """
+    n_win = len(valid_idx)
+    if n_win == 0:
+        return [], []
+
+    ep_id = np.searchsorted(ep_offset, valid_idx, side="right") - 1
+    uniq = np.unique(ep_id)
+
+    if len(uniq) < 2:
+        # Single episode: contiguous split with a seq_len gap so train and
+        # val windows share no frame.
+        n_val = max(1, int(round(val_frac * n_win)))
+        val_start = n_win - n_val
+        train_end = max(0, val_start - (seq_len - 1))
+        return list(range(train_end)), list(range(val_start, n_win))
+
+    rng = np.random.default_rng(seed)
+    order = uniq[rng.permutation(len(uniq))]
+    counts = {int(e): int((ep_id == e).sum()) for e in uniq}
+    target_val = max(1, int(round(val_frac * n_win)))
+
+    val_eps: set[int] = set()
+    cum = 0
+    for e in order:
+        if cum >= target_val or len(val_eps) >= len(uniq) - 1:
+            break
+        val_eps.add(int(e))
+        cum += counts[int(e)]
+
+    train_idx = [i for i in range(n_win) if int(ep_id[i]) not in val_eps]
+    val_idx = [i for i in range(n_win) if int(ep_id[i]) in val_eps]
+    return train_idx, val_idx
 
 
 __all__ = [
     "G1EmbSeqDataset",
     "G1HERTransitionDataset",
     "G1PatchSeqDataset",
+    "episode_aware_split",
 ]

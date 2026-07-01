@@ -13,12 +13,14 @@ The code path per forward:
 2. If a :attr:`patch_projector` is attached, it maps the backbone's
    raw per-token dim (e.g. 768 for DINOv3) down to the predictor's
    ``hidden_dim`` (e.g. 256).  No-op for flat-CLS backbones.
-3. If a :attr:`proprio_encoder` is attached, it produces a per-frame
-   embedding that is broadcast-added into ``emb`` (same scalar broadcast
-   as v4; unsqueezes over the patch axis for v5).
-4. ``action_encoder`` turns raw actions into per-frame conditioning.
-5. ``predictor`` autoregresses over the embedding given per-frame
-   conditioning.
+3. ``action_encoder`` (and, at train time, ``proprio_encoder``) produce
+   per-frame *conditioning*, summed into the vector ``c`` the predictor
+   is modulated by. Proprio is NOT fused into ``emb`` — the predicted
+   target stays visual-only, so the planner's goal is a plain image
+   embedding and the MPPI cost lives in one space (see
+   :mod:`vitruvian.training.losses`).
+4. ``predictor`` autoregresses over the embedding given per-frame
+   conditioning ``c``.
 
 The rollout API is identical across configurations so
 :class:`vitruvian.planning.mppi.MPPIPlanner` does not care which JEPA
@@ -58,9 +60,10 @@ class JEPA(nn.Module):
             ``(x, c)`` with ``x`` matching the embedding rank (3-D or
             4-D) and ``c`` the per-frame conditioning.
         action_encoder: Maps raw actions to per-frame conditioning.
-        proprio_encoder: Optional MLP over proprioception. Output is
-            broadcast-summed into the embedding (unsqueezed over the
-            patch axis for patch latents).
+        proprio_encoder: Optional MLP over proprioception. Used by the
+            training loss as predictor *conditioning* (summed with the
+            action embedding), never fused into the predicted target.
+            Held here so the loss/trainer and checkpoints can reach it.
         patch_projector: Optional per-token linear projection applied
             right after the backbone. Required for patch backbones
             whose raw token dim (e.g. 768) differs from the predictor
@@ -100,23 +103,14 @@ class JEPA(nn.Module):
         projected: torch.Tensor = self.patch_projector(emb_raw)
         return projected
 
-    def _fuse_proprio(
-        self, emb: torch.Tensor, proprio: torch.Tensor
-    ) -> torch.Tensor:
-        if self.proprio_encoder is None:
-            return emb
-        prop_emb: torch.Tensor = self.proprio_encoder(proprio.float())
-        if emb.dim() == 4:  # patch latents: broadcast over N
-            return emb + prop_emb.unsqueeze(2)
-        return emb + prop_emb  # flat CLS: direct sum
-
     def encode(self, info: dict[str, Any]) -> dict[str, Any]:
-        """Encode pixels (+ optional proprio) to the JEPA latent.
+        """Encode pixels to the JEPA (visual-only) latent.
 
         ``info`` must contain ``"pixels": (B, T, 3, H, W)``. If
-        ``"proprio"`` is present and a proprio encoder is attached, it
-        fuses into the embedding. If ``"action"`` is present it is
-        conditioned through ``action_encoder``.
+        ``"action"`` is present it is conditioned through
+        ``action_encoder``. Proprio is a predictor-conditioning signal
+        (applied by the training loss), NOT fused here — the latent
+        stays visual-only.
 
         Writes ``info["emb"]`` (shape matches backbone output rank) and
         ``info["act_emb"]`` if action present. Returns ``info``.
@@ -124,8 +118,6 @@ class JEPA(nn.Module):
         pixels = info["pixels"]
         emb_raw = self.backbone.encode(pixels)
         emb = self._project(emb_raw)
-        if "proprio" in info:
-            emb = self._fuse_proprio(emb, info["proprio"])
         info["emb"] = emb
         if "action" in info:
             info["act_emb"] = self.action_encoder(info["action"])

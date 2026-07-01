@@ -111,7 +111,11 @@ def test_migrated_file_loads_via_load_jepa(
 
     src = _make_legacy_v5_ckpt(tmp_path, registry_with_fakes)
     migrate_ckpt.migrate_ckpt(src, make_backup=False)
-    loaded = load_jepa(src, device="cpu")
+    # Schema is migrated, but the weights are still pre-arch-2 (proprio
+    # was fused into the target when they were trained), so load_jepa
+    # must warn that a retrain is needed.
+    with pytest.warns(UserWarning, match="arch_version"):
+        loaded = load_jepa(src, device="cpu")
     assert loaded.emb_dim == 128
     assert loaded.n_patches == 49
 

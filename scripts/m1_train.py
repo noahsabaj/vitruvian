@@ -23,34 +23,20 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import argparse
 import functools
 import pickle
+import sys
 import time
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 
+# Install the brax 0.14 × JAX 0.10 ``device_put_replicated`` shim from the
+# library rather than carrying a private copy. The sys.path insert lets a
+# bare ``python scripts/m1_train.py`` find the package (``uv run`` already
+# has it installed).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from vitruvian.env import install_jax_brax_shim
 
-def _device_put_replicated_shim(value, devices):
-    """Shim for jax.device_put_replicated, removed in JAX 0.10 but still
-    called by brax 0.14.2. Prepends a leading axis of size len(devices)
-    to every leaf so brax's _unpmap(...).squeeze(0) survives. Single-GPU
-    is our only case; multi-device would broadcast along axis 0."""
-    try:
-        n = len(devices)
-    except TypeError:
-        n = 1
-
-    def _replicate_leaf(x):
-        arr = jnp.asarray(x)
-        expanded = jnp.expand_dims(arr, 0)
-        if n > 1:
-            expanded = jnp.broadcast_to(expanded, (n,) + arr.shape)
-        return jax.device_put(expanded)
-
-    return jax.tree.map(_replicate_leaf, value)
-
-
-jax.device_put_replicated = _device_put_replicated_shim  # type: ignore[attr-defined]
+install_jax_brax_shim()
 
 import numpy as np
 from brax.training.agents.ppo import networks as ppo_networks

@@ -86,7 +86,14 @@ class FakeClsBackbone(nn.Module):
 
 
 class FakePatchBackbone(nn.Module):
-    """Deterministic stand-in for DINOv3 patch backbone."""
+    """Deterministic stand-in for DINOv3 patch backbone.
+
+    Produces per-patch-*distinct* tokens — each of the ``n_patches``
+    tokens is projected from its own pooled spatial cell — so tests
+    actually exercise spatial structure (per-patch positional
+    embeddings, spatial attention, the patch-mean cosine) instead of
+    ``n_patches`` identical copies of one global vector.
+    """
 
     output_dim = 768
     n_patches = 49
@@ -94,14 +101,13 @@ class FakePatchBackbone(nn.Module):
     def __init__(self, **_) -> None:
         super().__init__()
         self._rng = torch.Generator().manual_seed(1)
-        self._proj = nn.Linear(
-            3 * 32 * 32, self.output_dim, bias=False
-        )
+        self._side = int(self.n_patches**0.5)  # 7×7 = 49 cells
+        self._patch_proj = nn.Linear(3, self.output_dim, bias=False)
         with torch.no_grad():
-            self._proj.weight.normal_(
-                generator=self._rng, mean=0.0, std=1e-3
+            self._patch_proj.weight.normal_(
+                generator=self._rng, mean=0.0, std=1e-2
             )
-        for p in self._proj.parameters():
+        for p in self._patch_proj.parameters():
             p.requires_grad_(False)
 
     def load_eagerly(self) -> None:  # no-op, keeps duck-typing happy
@@ -112,14 +118,13 @@ class FakePatchBackbone(nn.Module):
         x = pixels.float()
         if x.max() > 1.5:
             x = x / 255.0
-        # Stride-2 pool to 32×32, project to 768, broadcast across N
-        # patches. Enough signal to exercise shape plumbing.
+        # Pool to an N-cell grid; project each cell's RGB independently so
+        # the N patch tokens carry distinct, input-dependent signal.
         x = torch.nn.functional.adaptive_avg_pool2d(
-            x.reshape(B * T, 3, 224, 224), (32, 32)
-        )
-        flat = x.reshape(B * T, -1)
-        proj = self._proj(flat)  # (B*T, 768)
-        out = proj.unsqueeze(1).expand(-1, self.n_patches, -1).contiguous()
+            x.reshape(B * T, 3, 224, 224), (self._side, self._side)
+        )  # (B*T, 3, side, side)
+        x = x.permute(0, 2, 3, 1).reshape(B * T, self.n_patches, 3)
+        out = self._patch_proj(x)  # (B*T, N, 768) — distinct per patch
         return out.reshape(B, T, self.n_patches, self.output_dim)
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:

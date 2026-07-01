@@ -23,7 +23,7 @@ three files in the legacy ``vitruvian.hwm`` package):
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, Self, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -69,20 +69,46 @@ class DINOv3ClsBackbone(nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
         freeze: bool = True,
+        lazy: bool = False,
     ) -> None:
+        """
+        Args:
+            lazy: If True, skip loading the DINOv3 weights into VRAM at
+                construction — use when training reads a precomputed CLS
+                cache (the 344 MB of weights would otherwise waste VRAM
+                the trainable predictor needs). ``output_dim`` is set from
+                ViT-B/16 defaults so downstream shape checks still work;
+                :meth:`load_eagerly` hydrates the weights later (called
+                automatically by :meth:`encode`, and by
+                ``vit-plan``/``vit-eval`` at startup).
+        """
         super().__init__()
-        from transformers import AutoModel  # lazy
-
         self.model_id = model_id
         self.dtype = dtype
         self.device_str = device
         self.frozen = freeze
-
+        self._normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         # Typed Any because HF AutoModel returns a dynamic subclass that
         # carries attributes mypy can't introspect (config.hidden_size,
         # last_hidden_state on outputs, etc.).
-        self.dinov3: Any = AutoModel.from_pretrained(model_id, dtype=dtype).to(device)
-        if freeze:
+        self.dinov3: Any = None
+
+        if lazy:
+            self.output_dim = 768  # ViT-B/16 hidden size
+            return
+
+        self.load_eagerly()
+
+    def load_eagerly(self) -> None:
+        """Load the DINOv3 weights into VRAM. Idempotent."""
+        if self.dinov3 is not None:
+            return
+        from transformers import AutoModel
+
+        self.dinov3 = AutoModel.from_pretrained(
+            self.model_id, dtype=self.dtype
+        ).to(self.device_str)
+        if self.frozen:
             for p in self.dinov3.parameters():
                 p.requires_grad_(False)
             self.dinov3.eval()
@@ -90,10 +116,10 @@ class DINOv3ClsBackbone(nn.Module):
         hidden = int(self.dinov3.config.hidden_size)
         self.output_dim = hidden
 
-        self._normalize = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224, device=device, dtype=dtype)
+            dummy = torch.zeros(
+                1, 3, 224, 224, device=self.device_str, dtype=self.dtype
+            )
             out = self.dinov3(pixel_values=dummy)
             assert out.last_hidden_state.shape[-1] == hidden, (
                 f"DINOv3 last_hidden_state last dim {out.last_hidden_state.shape[-1]} "
@@ -116,6 +142,8 @@ class DINOv3ClsBackbone(nn.Module):
         Returns:
             ``emb (B, T, D_out)`` float32.
         """
+        if self.dinov3 is None:
+            self.load_eagerly()
         assert pixels.dim() == 5, (
             f"expected (B, T, 3, H, W), got {tuple(pixels.shape)}"
         )
@@ -132,6 +160,17 @@ class DINOv3ClsBackbone(nn.Module):
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
+
+    def train(self, mode: bool = True) -> Self:
+        """Keep the frozen encoder in eval mode (no dropout, deterministic
+        features) even when a parent ``.train()`` propagates down — the
+        frozen-prior invariant must hold regardless of the composer's
+        mode. Without this, ``JEPA.train()`` would silently re-enable
+        DINOv3 dropout."""
+        super().train(mode)
+        if self.frozen and self.dinov3 is not None:
+            self.dinov3.eval()
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +313,14 @@ class DINOv3PatchBackbone(nn.Module):
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
 
+    def train(self, mode: bool = True) -> Self:
+        """Keep the frozen encoder in eval mode even under a parent
+        ``.train()`` (see :meth:`DINOv3ClsBackbone.train`)."""
+        super().train(mode)
+        if self.frozen and self.dinov3 is not None:
+            self.dinov3.eval()
+        return self
+
 
 # --------------------------------------------------------------------------
 # LeWM-compatible backbone (legacy v3 checkpoints)
@@ -335,6 +382,14 @@ class LeWMBackbone(nn.Module):
 
     def forward(self, pixels: torch.Tensor) -> torch.Tensor:
         return self.encode(pixels)
+
+    def train(self, mode: bool = True) -> Self:
+        """Keep the frozen LeWM JEPA encoder in eval mode under a parent
+        ``.train()`` (see :meth:`DINOv3ClsBackbone.train`)."""
+        super().train(mode)
+        if self.frozen:
+            self.jepa.eval()
+        return self
 
 
 def load_lewm_jepa_from_checkpoint(

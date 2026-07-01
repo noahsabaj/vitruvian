@@ -117,7 +117,12 @@ class MPPIPlanner(nn.Module):
         Args:
             pixel_history: ``(H_hist, 3, H, W)`` head-cam frames, uint8
                 or float in ``[0, 1]``.
-            action_history: ``(H_hist, action_dim)`` primitive actions.
+            action_history: ``(n, action_dim)`` recent executed actions.
+                The planner uses the most recent ``history_size - 1`` of
+                them as the actions at the leading context frames; the
+                action at the current (last) context frame is ``U[0]``,
+                the first action being planned. Short/empty histories are
+                zero-padded.
             warm_start_U: ``(horizon, action_dim)`` optional PPO-policy
                 rollout to seed MPPI's Gaussian sample cloud.
             encoded_history: ``(H_hist, *emb_shape)`` pre-encoded frame
@@ -139,6 +144,7 @@ class MPPIPlanner(nn.Module):
 
         ah = action_history.to(device).float()
 
+        # History FRAMES: the rollout consumes ``HS`` context frames.
         pixels_KS: torch.Tensor | None = None
         emb_KS: torch.Tensor | None = None
         if encoded_history is not None:
@@ -147,7 +153,6 @@ class MPPIPlanner(nn.Module):
                 pad_n = HS - eh.shape[0]
                 pad_tile = eh[:1].expand((pad_n,) + tuple(eh.shape[1:]))
                 eh = torch.cat([pad_tile, eh], dim=0)
-                ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
             eh = eh[-HS:]
             emb_KS = (
                 eh.unsqueeze(0)
@@ -163,14 +168,28 @@ class MPPIPlanner(nn.Module):
             if ph.shape[0] < HS:
                 pad_n = HS - ph.shape[0]
                 ph = torch.cat([ph[:1].expand(pad_n, -1, -1, -1), ph], dim=0)
-                ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
             ph = ph[-HS:]
             pixels_KS = ph.unsqueeze(0).unsqueeze(0).expand(
                 1, K, -1, -1, -1, -1
             )
 
-        ah = ah[-HS:]
-        hist_acts_KS = ah.unsqueeze(0).unsqueeze(0).expand(1, K, -1, -1)
+        # History ACTIONS: the predictor pairs action ``a_t`` with frame
+        # ``s_t`` (``a_t`` drives ``s_t -> s_{t+1}``). The action at the
+        # LAST context frame — the current observation — is the first
+        # action we are planning, ``U[0]``; it is concatenated below and
+        # lands in the ``HS``-th action slot. So only the first ``HS-1``
+        # context frames carry *given* history actions. (The previous
+        # code put ``HS`` history actions here, shoving every planned
+        # action one step into the future relative to the frames.)
+        n_hist_act = max(HS - 1, 0)
+        if n_hist_act > 0:
+            ah = ah[-n_hist_act:]
+            if ah.shape[0] < n_hist_act:
+                pad_n = n_hist_act - ah.shape[0]
+                ah = torch.cat([torch.zeros(pad_n, A, device=device), ah], dim=0)
+            hist_acts_KS = ah.unsqueeze(0).unsqueeze(0).expand(1, K, -1, -1)
+        else:
+            hist_acts_KS = torch.zeros(1, K, 0, A, device=device)
 
         # Priority: warm-start > shifted (receding-horizon) > zeros.
         if warm_start_U is not None:

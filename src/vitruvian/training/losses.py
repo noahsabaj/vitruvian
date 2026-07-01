@@ -3,12 +3,27 @@
 """JEPA training losses.
 
 * :func:`prediction_loss` — 1-step teacher-forced MSE + k-step rollout
-  MSE. Shape-polymorphic: accepts batches with either a flat
-  ``"emb"`` field (v4 CLS) or a ``"patches"`` field (v5, projected
-  internally).
-* :func:`vicreg_std_loss` — VICReg variance regularizer over the
-  projected embedding. Prevents ``patch_projector`` from collapsing
-  to a constant — the empirical failure mode of the v5 first pass.
+  MSE. Shape-polymorphic: accepts batches with either a flat ``"emb"``
+  field (v4 CLS) or a ``"patches"`` field (v5, projected internally).
+  The prediction **target is a clean, visual-only future embedding**;
+  proprioception and action enter as predictor *conditioning*, never
+  summed into the target (see :func:`_conditioning`).
+* :func:`sigreg_loss` — SIGReg isotropic-Gaussian regularizer (LeJEPA)
+  over the projected embedding; the default anti-collapse term.
+* :func:`vicreg_std_loss` — the older VICReg variance regularizer, kept
+  for ablation / backward reference.
+
+**Design note — proprio as conditioning, not target fusion (M5).**
+Recent action-conditioned JEPA world models (V-JEPA 2-AC arXiv:2506.09985,
+VLA-JEPA arXiv:2602.10098, Causal-JEPA arXiv:2602.11389) keep the
+prediction target a pure future-*state* embedding and inject action /
+proprio only as predictor conditioning; Causal-JEPA ablates that
+separate conditioning beats fusing auxiliaries into the state latent.
+This module follows that: the target is visual-only, so the planner's
+goal is a plain image embedding and the MPPI cost is computed in one
+clean space. Proprio conditioning is applied with per-frame dropout so
+the model stays robust when proprio is absent — which is the case for
+the *future* steps of a plan-time rollout, where no proprio is observed.
 """
 
 from __future__ import annotations
@@ -27,49 +42,89 @@ class _JEPALike(Protocol):
     patch_projector: nn.Module | None
     action_encoder: nn.Module
 
-    def predict(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor: ...
+    def predict(self, emb: torch.Tensor, cond: torch.Tensor) -> torch.Tensor: ...
 
 
 def vicreg_std_loss(emb: torch.Tensor, *, eps: float = 1e-4) -> torch.Tensor:
-    """Penalize per-channel embedding std below 1.
+    """Penalize per-channel embedding std below 1 (VICReg variance term).
 
     ``emb`` is flattened over all non-channel dims before std is
     computed, so this works uniformly for flat ``(B, T, D)`` or patch
-    ``(B, T, N, D)`` latents.
+    ``(B, T, N, D)`` latents. Kept for ablation; :func:`sigreg_loss` is
+    the default (it also suppresses higher-order structure, not just
+    per-channel variance).
     """
     flat = emb.reshape(-1, emb.shape[-1])
     std = flat.std(dim=0, unbiased=False) + eps
     return torch.relu(1.0 - std).mean()
 
 
-def _fuse_proprio(
-    emb: torch.Tensor, proprio: torch.Tensor, proprio_encoder: nn.Module | None
+def sigreg_loss(
+    emb: torch.Tensor,
+    *,
+    num_proj: int = 1024,
+    knots: int = 17,
 ) -> torch.Tensor:
-    if proprio_encoder is None:
-        return emb
-    prop_emb: torch.Tensor = proprio_encoder(proprio.float())  # (B, T, hidden)
-    if emb.dim() == 4:
-        return emb + prop_emb.unsqueeze(2)
-    return emb + prop_emb
+    """SIGReg isotropic-Gaussian regularizer (LeJEPA, arXiv:2511.08544).
+
+    Pushes the embedding distribution toward an isotropic Gaussian by
+    matching its empirical characteristic function to that of ``N(0, I)``
+    along ``num_proj`` random 1-D projections, integrated over ``knots``
+    Gauss-windowed quadrature points on ``[0, 3]``. It *strictly
+    generalizes* the VICReg std term (which only matches second-order
+    per-channel variance) and — proven in "When Does LeJEPA Learn a
+    World Model?" (arXiv:2605.26379) — yields linearly identifiable
+    latents, the property that makes latent-space planning well-posed.
+    It needs no EMA / stop-gradient, so it fits the frozen-prior design.
+
+    Every non-channel dim is flattened into the sample axis. We omit
+    SIGReg's ``* n`` test-statistic scaling so the term is O(1) (and
+    ``reg_weight`` stays comparable to the old VICReg weight), and we
+    loop over knots to cap peak memory at ``O(S * num_proj)`` instead of
+    materializing an ``(S, num_proj, knots)`` tensor. The random
+    projections are resampled each call (a stochastic sketch), matching
+    the vendored :class:`vitruvian.lewm_compat.SIGReg`.
+    """
+    flat = emb.reshape(-1, emb.shape[-1]).float()  # (S, D)
+    d = flat.shape[-1]
+    dev = flat.device
+    a = torch.randn(d, num_proj, device=dev)
+    a = a / (a.norm(dim=0, keepdim=True) + 1e-8)
+    proj = flat @ a  # (S, num_proj)
+
+    t = torch.linspace(0.0, 3.0, knots, device=dev)
+    dt = 3.0 / (knots - 1)
+    quad = torch.full((knots,), 2.0 * dt, device=dev)
+    quad[0] = dt
+    quad[-1] = dt
+    phi = torch.exp(-t.square() / 2.0)  # real CF of N(0,1); also the window
+    quad = quad * phi
+
+    stat = torch.zeros(num_proj, device=dev)
+    for k in range(knots):
+        ang = proj * t[k]
+        err_k = (ang.cos().mean(0) - phi[k]).square() + ang.sin().mean(0).square()
+        stat = stat + quad[k] * err_k
+    return stat.mean()
 
 
 def _compute_emb(
     model: _JEPALike, batch: dict[str, torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the per-frame embedding the predictor will consume.
+    """Build the visual-only per-frame embedding the predictor consumes
+    (and predicts against).
 
-    Returns ``(emb, emb_for_std)`` — the input to the predictor and a
-    separate tensor for the VICReg std regularizer. For v4 both are
-    identical; for v5 the std is computed AFTER projection + proprio
-    fusion (where collapse actually happens).
+    Returns ``(emb, emb_for_reg)``. Proprio is NOT fused in — it is a
+    conditioning signal (see :func:`_conditioning`), so the target and
+    the regularized tensor are both pure visual. The tuple is kept for
+    call-site stability; the two entries are currently identical.
     """
     # v4: batch already contains precomputed CLS embeddings.
     if "emb" in batch:
         emb = batch["emb"]  # (B, T, D)
-        emb = _fuse_proprio(emb, batch["proprio"], model.proprio_encoder)
         return emb, emb
 
-    # v5: batch contains precomputed patch tensors; project + fuse here.
+    # v5: batch contains precomputed patch tensors; project here.
     if "patches" in batch:
         raw = batch["patches"].float()  # (B, T, N, 768)
         if model.patch_projector is None:
@@ -77,12 +132,40 @@ def _compute_emb(
                 "patches batch requires the JEPA to carry a patch_projector"
             )
         emb = model.patch_projector(raw)  # (B, T, N, hidden)
-        emb = _fuse_proprio(emb, batch["proprio"], model.proprio_encoder)
         return emb, emb
 
     raise KeyError(
         "batch must contain either 'emb' (v4 CLS) or 'patches' (v5)"
     )
+
+
+def _conditioning(
+    model: _JEPALike,
+    batch: dict[str, torch.Tensor],
+    proprio_dropout: float,
+) -> torch.Tensor:
+    """Per-frame predictor conditioning ``(B, T, hidden)``.
+
+    ``cond = action_encoder(action) + proprio_encoder(proprio)``. During
+    training, whole frames of proprio are zeroed with probability
+    ``proprio_dropout`` so the predictor learns to operate with the
+    proprio conditioning absent — which is exactly the plan-time rollout
+    regime (future proprio is unobserved). ``proprio_encoder(0)`` is a
+    learned constant meaning "proprio unknown", consistent between the
+    dropped training frames and the missing rollout frames.
+    """
+    cond: torch.Tensor = model.action_encoder(batch["action"])
+    pe = model.proprio_encoder
+    if pe is not None and "proprio" in batch:
+        prop = batch["proprio"].float()
+        if proprio_dropout > 0.0 and getattr(model, "training", False):
+            keep = (
+                torch.rand(prop.shape[0], prop.shape[1], 1, device=prop.device)
+                >= proprio_dropout
+            ).to(prop.dtype)
+            prop = prop * keep
+        cond = cond + pe(prop)
+    return cond
 
 
 def prediction_loss(
@@ -92,66 +175,66 @@ def prediction_loss(
     history_size: int,
     num_preds: int,
     rollout_weight: float = 1.0,
-    std_weight: float = 0.0,
+    reg_weight: float = 0.0,
+    proprio_dropout: float = 0.0,
 ) -> dict[str, Any]:
     """Terver-recipe training loss for any JEPA shape.
 
     Recipe (Terver et al. arXiv:2512.24497 eq. 5):
 
     * **1-step teacher-forced MSE** — given context frames ``[0..T_hist-1]``
-      and actions at those frames, the predictor outputs a per-position
+      and their conditioning, the predictor outputs a per-position
       prediction. Under causal masking, output at position ``t`` depends
       on inputs ``[0..t]``, and is trained against the next frame
       ``emb[t+1]``. So the target is ``emb[:, 1:T_hist+1]``.
     * **k-step rollout MSE** — k from 1 up to ``num_preds - 1``. The
       rolling window advances one step per iteration: drop the oldest
-      frame, append the last prediction, recompute. The k-th rollout's
-      last-position output is compared to ``emb[T_hist + k - 1]`` — the
-      ground-truth frame one step ahead of the last rolling-window
-      position.
+      frame, append the last prediction, recompute. After ``k`` steps the
+      window spans frames ``[k .. T_hist + k - 1]`` (its last position is
+      frame ``T_hist + k - 1``), so its last-position output predicts the
+      *next* frame ``T_hist + k`` — the target ``emb[T_hist + k]``. (For
+      the final ``k = num_preds - 1`` this is the last supplied frame, so
+      every frame is used.)
 
-    The upstream LeWM codebase uses ``tgt_emb = emb[:, n_preds:]``
-    instead of ``emb[:, 1:T_hist+1]``, effectively training the
-    predictor to do ``num_preds``-step extrapolation. Empirically that
-    still converges, but its rollout loop becomes misaligned with the
-    TF step (the rollout compares single-frame targets against
-    ``num_preds``-step predictions). M4.9.1 restores the clean
-    Terver recipe the docstring has been claiming all along. See the
-    M4.9.1 plan for the audit trail.
+    The target ``emb`` is **visual-only**; proprio/action are conditioning
+    (see module docstring + :func:`_conditioning`), so the planner's goal
+    is a plain image embedding and the MPPI cost lives in one clean space.
 
     Args:
-        model: :class:`vitruvian.models.JEPA` or a legacy ``JEPAv4`` /
-            ``JEPAv5`` — duck-typed to ``.proprio_encoder``,
-            ``.action_encoder``, ``.patch_projector`` / ``.patch_proj``,
-            and ``.predict(emb, act_emb)``.
-        batch: dict with ``"proprio"``, ``"action"``, and either
+        model: :class:`vitruvian.models.JEPA` or a duck-typed equivalent
+            exposing ``.proprio_encoder``, ``.action_encoder``,
+            ``.patch_projector`` and ``.predict(emb, cond)``.
+        batch: dict with ``"action"``, optional ``"proprio"``, and either
             ``"emb"`` (v4) or ``"patches"`` (v5).
         history_size: ``T_hist``; the predictor consumes the first
             ``T_hist`` frames.
-        num_preds: max rollout horizon ``K``; total sequence length
-            must be ``T_hist + K``.
+        num_preds: max rollout horizon ``K``; sequence length must be
+            ``T_hist + K``.
         rollout_weight: coefficient on the k-step rollout MSE.
-        std_weight: coefficient on :func:`vicreg_std_loss` over the
-            projected embedding. Use a positive value (e.g. 1.0) with
-            the v5 patch head to prevent collapse.
+        reg_weight: coefficient on :func:`sigreg_loss` over the projected
+            embedding. Use a positive value (e.g. 1.0) with the v5 patch
+            head to prevent collapse. (Renamed from ``std_weight``; it now
+            weights SIGReg, not the VICReg std term.)
+        proprio_dropout: probability of zeroing a frame's proprio
+            conditioning during training (0 disables). ~0.5 keeps the
+            model robust to the proprio-free future of a plan rollout.
 
     Returns:
         Dict with ``"loss"`` (combined), ``"pred_loss"``,
-        ``"rollout_loss"``, ``"std_loss"``, ``"n_rollout_steps"``.
+        ``"rollout_loss"``, ``"reg_loss"``, ``"n_rollout_steps"``.
     """
-    emb, emb_for_std = _compute_emb(model, batch)
-
-    act_emb = model.action_encoder(batch["action"])
+    emb, emb_for_reg = _compute_emb(model, batch)
+    cond = _conditioning(model, batch, proprio_dropout)
 
     ctx_len = int(history_size)
     n_preds = int(num_preds)
 
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
+    ctx_cond = cond[:, :ctx_len]
     # 1-step TF target: at each context position t, predict emb[t+1].
     tgt_emb = emb[:, 1 : ctx_len + 1]
 
-    pred_emb = model.predict(ctx_emb, ctx_act)
+    pred_emb = model.predict(ctx_emb, ctx_cond)
     pred_loss = (pred_emb - tgt_emb).pow(2).mean()
 
     rollout_losses: list[torch.Tensor] = []
@@ -161,21 +244,25 @@ def prediction_loss(
             rolling_emb = torch.cat(
                 [rolling_emb[:, 1:], pred_emb[:, -1:]], dim=1
             )
-            rolling_act = act_emb[:, k : k + ctx_len]
-            pred_emb = model.predict(rolling_emb, rolling_act)
-            tgt_k = emb[:, k + ctx_len - 1 : k + ctx_len]
+            rolling_cond = cond[:, k : k + ctx_len]
+            pred_emb = model.predict(rolling_emb, rolling_cond)
+            # Window ends at frame ``k + ctx_len - 1``; its last-position
+            # output predicts the NEXT frame, so the target is
+            # ``emb[k + ctx_len]`` (not ``k + ctx_len - 1``, which is the
+            # window's own last input and would train a copy).
+            tgt_k = emb[:, k + ctx_len : k + ctx_len + 1]
             rollout_losses.append((pred_emb[:, -1:] - tgt_k).pow(2).mean())
         rollout_loss = sum(rollout_losses) / max(1, len(rollout_losses))
     else:
         rollout_loss = torch.zeros((), device=emb.device)
 
-    std_loss = (
-        vicreg_std_loss(emb_for_std)
-        if std_weight > 0
+    reg_loss = (
+        sigreg_loss(emb_for_reg)
+        if reg_weight > 0
         else torch.zeros((), device=emb.device)
     )
 
-    total = pred_loss + rollout_weight * rollout_loss + std_weight * std_loss
+    total = pred_loss + rollout_weight * rollout_loss + reg_weight * reg_loss
     return {
         "loss": total,
         "pred_loss": pred_loss.detach(),
@@ -184,9 +271,9 @@ def prediction_loss(
             if torch.is_tensor(rollout_loss)
             else torch.zeros((), device=emb.device)
         ),
-        "std_loss": std_loss.detach(),
+        "reg_loss": reg_loss.detach(),
         "n_rollout_steps": len(rollout_losses),
     }
 
 
-__all__ = ["prediction_loss", "vicreg_std_loss"]
+__all__ = ["prediction_loss", "sigreg_loss", "vicreg_std_loss"]

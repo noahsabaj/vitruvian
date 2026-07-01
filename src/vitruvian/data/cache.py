@@ -35,7 +35,7 @@ Callers after M4.7:
   * `scripts/m4e_train_jepa_v4.py:precompute_embeddings` → replaced by
     ``EmbeddingCache.from_precompute(mode="cls")``.
   * `scripts/m4f_train_jepa_v5.py:precompute_patch_embeddings` →
-    ``mode="patch7"`` (7×7 subsampled).
+    ``mode="patch2"`` (spatial_stride=2 → 7×7 = 49 tokens).
   * `scripts/m4e_train_vf_her.py` → ``load`` (never computes, reuses
     the v4/v5 training cache).
 """
@@ -96,11 +96,13 @@ class CacheKey:
 class EmbeddingCache:
     """Handle to a precomputed encoder cache on disk.
 
-    Use ``.tensor`` to get the memory-mapped CPU tensor. Shape depends
+    Use ``.tensor`` to get the memory-mapped CPU tensor. The mode string
+    is ``"cls"`` or ``f"patch{spatial_stride}"`` (see
+    :func:`vitruvian.data.precompute.build_patch_cache`). Shape depends
     on ``mode``:
       * ``"cls"``:    (N, D)
-      * ``"patch7"``: (N, 49, D)
-      * ``"patch14"``: (N, 196, D)
+      * ``"patch2"``: (N, 49, D)   — stride-2 subsample of the 14×14 grid
+      * ``"patch1"``: (N, 196, D)  — full 14×14 grid (no subsampling)
     """
 
     def __init__(

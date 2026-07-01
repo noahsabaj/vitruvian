@@ -74,6 +74,15 @@ def main() -> None:
         "the run to raise after the merge step (the surviving chunks "
         "are still written to the output HDF5).",
     )
+    ap.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Number of chunk subprocesses to run CONCURRENTLY (default 1 "
+        "= serial). Each chunk is GPU-isolated, so this is bounded by GPU "
+        "memory: ~16-24 on a 96 GB card, ~2-3 on 8 GB. The main collection "
+        "speed lever. Ignored with --single-process.",
+    )
     args = ap.parse_args()
 
     cfg_dict = load_config(args.config, overrides=args.override)
@@ -82,6 +91,7 @@ def main() -> None:
         cfg,
         single_process=args.single_process,
         allow_partial=args.allow_partial,
+        max_workers=args.max_workers,
     )
 
 

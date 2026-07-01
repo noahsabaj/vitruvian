@@ -151,6 +151,10 @@ class JEPATrainer:
             "epoch": epoch,
             "metrics": metrics,
             "run_name": self.run_name,
+            # arch_version 2: visual-only prediction target + proprio/action
+            # as predictor conditioning (M5). Pre-2 checkpoints trained a
+            # proprio-fused target and are semantically incompatible.
+            "arch_version": 2,
         }
         for suffix in suffixes:
             path = self.out_dir / (suffix.format(epoch=epoch) + ".pt")

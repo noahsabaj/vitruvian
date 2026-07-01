@@ -17,6 +17,7 @@ transparently migrated in memory.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -324,6 +325,15 @@ def load_jepa(
     if "config" not in ckpt:
         raise RuntimeError(
             f"checkpoint at {ckpt_path} has no 'config' — cannot dispatch"
+        )
+    if int(ckpt.get("arch_version", 1)) < 2:
+        warnings.warn(
+            f"{ckpt_path} predates the visual-only-target / "
+            "proprio-as-conditioning change (arch_version < 2): its "
+            "predictor was trained against a proprio-fused target and "
+            "will behave incorrectly under the current model. Retrain "
+            "with the current code.",
+            stacklevel=2,
         )
 
     cfg = dict(ckpt["config"])

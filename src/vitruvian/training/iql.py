@@ -112,15 +112,22 @@ class VFHERTrainer:
         s_emb = self.fuse(batch["emb_t"], batch["prop_t"])
         sp_emb = self.fuse(batch["emb_tp1"], batch["prop_tp1"])
         g_emb = self.fuse(batch["emb_g"], batch["prop_g"])
-        is_self = batch["is_goal_self"].bool()
+        # Terminal transitions of the relabeled goal-reaching MDP: s' == g.
+        is_reached = batch["is_goal_reached"].bool()
 
         r = torch.where(
-            is_self,
-            torch.full_like(is_self, self.cfg.reward_self_loop, dtype=s_emb.dtype),
-            torch.full_like(is_self, self.cfg.reward_step, dtype=s_emb.dtype),
+            is_reached,
+            torch.full_like(is_reached, self.cfg.reward_self_loop, dtype=s_emb.dtype),
+            torch.full_like(is_reached, self.cfg.reward_step, dtype=s_emb.dtype),
         )
         with torch.no_grad():
             v_next = self.target_head(sp_emb, g_emb)
+            # Drop the bootstrap at terminal (goal-reached) transitions.
+            # Without this every transition has reward ``reward_step`` and
+            # always bootstraps, so V collapses to the constant
+            # ``reward_step / (1 - gamma)`` and ValueHeadCost becomes
+            # uninformative for planning.
+            v_next = torch.where(is_reached, torch.zeros_like(v_next), v_next)
         v_now = self.value_head(s_emb, g_emb)
         target = r + self.cfg.gamma * v_next
         loss = expectile_loss(target - v_now, self.cfg.expectile)

@@ -263,7 +263,8 @@ def rollout_policy_warm_start(
 def load_goal_pixel(h5_path: Path, idx: int, ep_idx: int) -> np.ndarray:
     """Pick a mid-episode frame from the expert HDF5 as a goal image.
 
-    Returns ``(224, 224, 3)`` uint8.
+    Returns ``(224, 224, 3)`` uint8. The world-model target is
+    visual-only, so the goal is a plain image (no proprio needed).
     """
     with h5py.File(h5_path, "r") as f:
         off = int(f["ep_offset"][ep_idx])
