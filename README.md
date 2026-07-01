@@ -28,9 +28,17 @@ project builds the software substrate (frozen priors + plastic world
 model + self-learning) on top of G1 rather than designing its own
 robot.
 
-Next up: **Phase 4 — self-learning** (intrinsic motivation, episodic
-memory, long-horizon sparse-reward tasks). Scope is open-ended; no
-committed milestone list yet.
+**M5** (2026-06-30) hardened the world model — a review-driven
+correctness pass + a JEPA modernization (SIGReg anti-collapse,
+proprio-as-conditioning, DINOv3 kept over V-JEPA) — now retraining from
+scratch on cloud hardware as the **baseline**.
+
+Next up: per [ADR 009](docs/decisions/009-thesis-question-milestones.md)
+the project pivots from engineering milestones to **thesis-question
+milestones** and **decouples the world model from task reward** —
+intrinsic cost + intrinsic motivation + goal-conditioned planning, not a
+reward-trained policy. The first question (**Q1**): does the planner
+beat the policy that trained it, on out-of-distribution goals?
 
 - **Plan:** [`docs/roadmap.md`](docs/roadmap.md)
 - **Thesis:** [`docs/thesis.md`](docs/thesis.md)
