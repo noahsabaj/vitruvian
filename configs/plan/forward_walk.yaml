@@ -1,5 +1,5 @@
 # Default forward-walk plan config. 50-primitive macros × 10 = 10s walk.
-ckpt: ~/.vitruvian/m4f_v5/best.pt
+ckpt: ~/.vitruvian/jepa_v5/best.pt
 policy_ckpt: checkpoints/m1-g1-full/000043253760
 h5: ~/.stable_worldmodel/g1_diverse_v1.h5
 goal_ep: 20
