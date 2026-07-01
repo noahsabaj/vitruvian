@@ -169,6 +169,99 @@ def rollout_accuracy(
     }
 
 
+def action_sensitivity(
+    jepa: JEPA,
+    patch_cache: torch.Tensor,
+    ep_offset: np.ndarray,
+    ep_len: np.ndarray,
+    action: torch.Tensor,
+    episodes: Sequence[int],
+    *,
+    history_size: int,
+    horizon: int,
+    device: str,
+    n_cand: int = 64,
+    noise_sigma: float = 0.3,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """How much do *different* action sequences change the predicted terminal
+    latent? If "barely" relative to the forward motion, MPPI has nothing to
+    discriminate on — the mechanistic cause of weak steering (Delta-JEPA /
+    2606.30068 hypothesis).
+
+    Per held-out episode: seed with H history frames, roll out ``n_cand``
+    candidate action sequences, and measure the spread of the predicted terminal
+    latents two ways — "local" (recorded actions + N(0, noise_sigma), MPPI's own
+    regime) and "diverse" (uniform in the action box, an upper bound on
+    responsiveness). Reports ``spread`` (RMS distance of terminals from their
+    centroid), ``fwd`` (mean distance from the seed latent), and
+    ``spread/fwd`` (≈ fraction of forward motion that is action-controllable),
+    plus ``cost_cv`` (coefficient of variation of MSE-to-an-in-episode-goal
+    across the local candidates — the exact quantity MPPI ranks on; ~0 ⇒ MPPI
+    cannot discriminate).
+    """
+    jepa.eval()
+    proj = jepa.patch_projector
+    if proj is None:
+        raise ValueError("action_sensitivity requires a patch JEPA (patch_projector)")
+    H, A = int(history_size), int(action.shape[-1])
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    keys = (
+        "local_spread", "local_fwd", "local_ratio",
+        "diverse_spread", "diverse_fwd", "diverse_ratio", "cost_cv", "traj_std",
+    )
+    acc: dict[str, list[float]] = {k: [] for k in keys}
+    autocast = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device == "cuda"
+        else nullcontext()
+    )
+    with torch.no_grad(), autocast:
+        for e in episodes:
+            off, L = int(ep_offset[e]), int(ep_len[e])
+            if L < H + horizon + 1:
+                continue
+            gt = proj(patch_cache[off : off + L].float().to(device))  # (L, N, D)
+            emb_init = gt[:H]
+            z_init = emb_init[-1].reshape(-1)
+            z_goal = gt[H + horizon].reshape(-1)  # in-episode goal
+            acc["traj_std"].append(float(gt.reshape(L, -1).std(dim=0).mean()))
+            acts_rec = action[off : off + H + horizon].to(device)  # (H+horizon, A)
+
+            cand_sets = {
+                "local": (
+                    acts_rec.unsqueeze(0)
+                    + noise_sigma
+                    * torch.randn(n_cand, H + horizon, A, generator=gen).to(device)
+                ).clamp(-1.0, 1.0),
+                "diverse": (
+                    2.0 * torch.rand(n_cand, H + horizon, A, generator=gen).to(device)
+                    - 1.0
+                ),
+            }
+            for label, cand in cand_sets.items():
+                emb = (
+                    emb_init.unsqueeze(0).unsqueeze(0)
+                    .expand(1, n_cand, *emb_init.shape).contiguous()
+                )
+                out = jepa.rollout({"emb": emb}, cand.unsqueeze(0), history_size=H)
+                z = out["predicted_emb"][0, :, -1].reshape(n_cand, -1).float()
+                spread = float((z - z.mean(0, keepdim=True)).norm(dim=1).mean())
+                fwd = float((z - z_init).norm(dim=1).mean())
+                acc[f"{label}_spread"].append(spread)
+                acc[f"{label}_fwd"].append(fwd)
+                acc[f"{label}_ratio"].append(spread / (fwd + 1e-9))
+                if label == "local":
+                    costs = (z - z_goal).pow(2).mean(dim=1)
+                    acc["cost_cv"].append(float(costs.std() / (costs.mean() + 1e-9)))
+
+    summary: dict[str, Any] = {
+        k: (float(np.mean(v)) if v else float("nan")) for k, v in acc.items()
+    }
+    summary["n_episodes"] = len(acc["traj_std"])
+    return summary
+
+
 def _held_out_episodes(
     dataset: G1PatchSeqDataset, *, val_frac: float, seed: int, seq_len: int
 ) -> list[int]:
@@ -199,6 +292,26 @@ def main() -> None:
         type=int,
         default=None,
         help="Cap the number of held-out episodes evaluated (debug/speed).",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["rollout", "action-sens"],
+        default="rollout",
+        help="rollout = Q1a rollout-accuracy-vs-persistence; action-sens = "
+        "latent action-sensitivity diagnostic (do different action sequences "
+        "change the predicted terminal latent?).",
+    )
+    ap.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        help="Rollout horizon for --mode action-sens (default: cfg max_horizon).",
+    )
+    ap.add_argument(
+        "--n-cand",
+        type=int,
+        default=64,
+        help="Candidate action sequences per state for --mode action-sens.",
     )
     args = ap.parse_args()
 
@@ -240,6 +353,50 @@ def main() -> None:
     if args.max_episodes is not None:
         episodes = episodes[: args.max_episodes]
 
+    out_dir = (
+        Path(args.out_dir).expanduser()
+        if args.out_dir is not None
+        else Path(cfg.get("out_dir", "/tmp/vitruvian/rollout_eval")).expanduser()
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "action-sens":
+        horizon = (
+            args.horizon if args.horizon is not None
+            else int(cfg.get("max_horizon", 16))
+        )
+        res = action_sensitivity(
+            jepa, dataset.patches, dataset.ep_offset, dataset.ep_len,
+            dataset.action, episodes,
+            history_size=history_size, horizon=horizon,
+            device=device, n_cand=args.n_cand, seed=int(cfg.get("seed", 0)),
+        )
+        print(
+            f"[action-sens] held-out episodes: {res['n_episodes']}  "
+            f"(horizon={horizon}, n_cand={args.n_cand})"
+        )
+        print(
+            f"  local  : spread={res['local_spread']:.4f}  "
+            f"fwd={res['local_fwd']:.4f}  spread/fwd={res['local_ratio']:.4f}"
+        )
+        print(
+            f"  diverse: spread={res['diverse_spread']:.4f}  "
+            f"fwd={res['diverse_fwd']:.4f}  spread/fwd={res['diverse_ratio']:.4f}"
+        )
+        print(
+            f"  trajectory latent std={res['traj_std']:.4f} | "
+            f"MPPI cost CV (local)={res['cost_cv']:.4f}"
+        )
+        verdict = (
+            "LOW action-sensitivity — steering-limited (motivates LDAD)"
+            if res["diverse_ratio"] < 0.15
+            else "action-sensitive"
+        )
+        print(f"[action-sens] verdict: {verdict}")
+        (out_dir / "action_sensitivity.json").write_text(json.dumps(res, indent=2))
+        print(f"[action-sens] wrote {out_dir / 'action_sensitivity.json'}")
+        return
+
     res = rollout_accuracy(
         jepa,
         dataset.patches,
@@ -268,12 +425,6 @@ def main() -> None:
         f"persistence"
     )
 
-    out_dir = (
-        Path(args.out_dir).expanduser()
-        if args.out_dir is not None
-        else Path(cfg.get("out_dir", "/tmp/vitruvian/rollout_eval")).expanduser()
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "rollout_accuracy.json").write_text(json.dumps(res, indent=2))
     with (out_dir / "rollout_accuracy.tsv").open("w") as tf:
         tf.write("horizon\tmodel_cos\tpersist_cos\tmodel_mse\tpersist_mse\tn\n")

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from vitruvian.cli.rollout import rollout_accuracy
+from vitruvian.cli.rollout import action_sensitivity, rollout_accuracy
 from vitruvian.data import G1PatchSeqDataset
 from vitruvian.models import build_jepa
 
@@ -85,3 +85,20 @@ def test_rollout_accuracy_persistence_predictor(
         assert row["model_cos"] == pytest.approx(row["persist_cos"], abs=1e-5)
         assert row["model_mse"] == pytest.approx(row["persist_mse"], abs=1e-5)
     assert not res["summary"]["beats_persistence"]  # identical -> not strictly >
+
+
+def test_action_sensitivity_structural(registry_with_fakes, synthetic_h5) -> None:
+    m = build_jepa(_v5_cfg())
+    ds = _dataset(synthetic_h5)
+    res = action_sensitivity(
+        m, ds.patches, ds.ep_offset, ds.ep_len, ds.action, [0, 1],
+        history_size=3, horizon=8, device="cpu", n_cand=16,
+    )
+    assert res["n_episodes"] == 2
+    for k in (
+        "local_spread", "local_fwd", "local_ratio", "diverse_spread",
+        "diverse_fwd", "diverse_ratio", "cost_cv", "traj_std",
+    ):
+        assert np.isfinite(res[k]), f"{k} not finite"
+    assert res["local_spread"] >= 0.0 and res["diverse_spread"] >= 0.0
+    assert res["local_ratio"] >= 0.0 and res["diverse_ratio"] >= 0.0
