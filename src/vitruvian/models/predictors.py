@@ -223,4 +223,184 @@ class PatchARPredictor(nn.Module):
         return out
 
 
-__all__ = ["ARPredictor", "PatchARPredictor", "PatchBlock"]
+class _SpatialBlock(nn.Module):
+    """AdaLN-modulated spatial transformer block over ``(B, K, N, D)``.
+
+    One *independent* prediction per horizon ``k`` — spatial self-attention
+    over the ``N`` patches only, no cross-horizon (temporal) attention — so
+    Fast-LeWM's prefix predictions do not chain. Reuses the shared low-rank
+    AdaLN code (``c_trunk``, one per horizon) with a zero-init head (DiT
+    identity prior).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        adaln_rank: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn_s = _MHA(dim, heads, dim_head, dropout)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+        self.adaln_head = nn.Linear(adaln_rank, 6 * dim, bias=True)
+        nn.init.constant_(self.adaln_head.weight, 0)
+        nn.init.constant_(self.adaln_head.bias, 0)
+
+    def forward(self, x: torch.Tensor, c_trunk: torch.Tensor) -> torch.Tensor:
+        B, K, N, D = x.shape
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.adaln_head(
+            c_trunk
+        ).chunk(6, dim=-1)  # each (B, K, D)
+
+        def _e(m: torch.Tensor) -> torch.Tensor:
+            return m.unsqueeze(2)  # (B, K, 1, D)
+
+        xs = self.norm1(x)
+        xs = xs * (1 + _e(scale1)) + _e(shift1)
+        attn = self.attn_s(xs.reshape(B * K, N, D), causal=False).reshape(
+            B, K, N, D
+        )
+        x = x + _e(gate1) * attn
+
+        xm = self.norm2(x)
+        xm = xm * (1 + _e(scale2)) + _e(shift2)
+        x = x + _e(gate2) * self.mlp(xm)
+        return x
+
+
+class PrefixPatchPredictor(nn.Module):
+    """Fast-LeWM (arXiv:2606.26217) action-prefix parallel predictor.
+
+    Given the anchor (current) patch latent ``z_t`` and per-step action
+    embeddings ``a_t..a_{t+H-1}``, predicts ``ẑ_{t+1..t+H}`` in **one pass** —
+    each horizon anchored on ``z_t`` and conditioned on the action *prefix* up
+    to that horizon (via a causal action-prefix encoder). Predictions never
+    chain, so there is no compounding rollout error and all horizons compute in
+    parallel (the M6 fix for the horizon-error growth Q1a measured).
+
+    Shapes::
+
+        anchor  : (B, N, input_dim)      anchor patch latent
+        act_emb : (B, H, hidden_dim)     per-step action embeddings
+        output  : (B, H, N, output_dim)  ẑ_{t+1..t+H}
+    """
+
+    def __init__(
+        self,
+        *,
+        num_patches: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
+        input_dim: int,
+        hidden_dim: int | None = None,
+        output_dim: int | None = None,
+        dim_head: int = 32,
+        prefix_depth: int = 3,
+        dropout: float = 0.0,
+        adaln_rank: int = 128,
+        max_horizon: int = 8,
+    ) -> None:
+        super().__init__()
+        hidden = hidden_dim or input_dim
+        out = output_dim or input_dim
+
+        self.input_proj = (
+            nn.Linear(input_dim, hidden) if input_dim != hidden else nn.Identity()
+        )
+        self.output_proj = (
+            nn.Linear(hidden, out) if hidden != out else nn.Identity()
+        )
+        self.pos_spatial = nn.Parameter(torch.randn(1, num_patches, hidden) * 0.02)
+
+        # Action-prefix causal encoder over [state_token, a_0..a_{H-1}].
+        self.state_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+        )
+        self.prefix_pos = nn.Parameter(
+            torch.randn(1, max_horizon + 1, hidden) * 0.02
+        )
+        self.prefix_ln = nn.ModuleList(
+            [nn.LayerNorm(hidden) for _ in range(prefix_depth)]
+        )
+        self.prefix_attn = nn.ModuleList(
+            [_MHA(hidden, heads, dim_head, dropout) for _ in range(prefix_depth)]
+        )
+        self.prefix_mlp_ln = nn.ModuleList(
+            [nn.LayerNorm(hidden) for _ in range(prefix_depth)]
+        )
+        self.prefix_mlp = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, hidden)
+                )
+                for _ in range(prefix_depth)
+            ]
+        )
+        self.prefix_norm = nn.LayerNorm(hidden)
+
+        # Parallel spatial predictor.
+        self.adaln_trunk = nn.Sequential(nn.SiLU(), nn.Linear(hidden, adaln_rank))
+        self.blocks = nn.ModuleList(
+            [
+                _SpatialBlock(hidden, heads, dim_head, mlp_dim, adaln_rank, dropout)
+                for _ in range(depth)
+            ]
+        )
+        self.norm_out = nn.LayerNorm(hidden)
+
+        self.num_patches = int(num_patches)
+        self.hidden_dim = int(hidden)
+        self.max_horizon = int(max_horizon)
+        self.adaln_rank = int(adaln_rank)
+
+    def _encode_prefixes(
+        self, state_tok: torch.Tensor, act_emb: torch.Tensor
+    ) -> torch.Tensor:
+        """[state, a_0..a_{H-1}] --causal--> prefix tokens (B, H, hidden), where
+        token k summarizes only a_0..a_{k-1} (plus the state token)."""
+        H = act_emb.shape[1]
+        toks = torch.cat([state_tok.unsqueeze(1), act_emb], dim=1)  # (B, H+1, h)
+        toks = toks + self.prefix_pos[:, : H + 1]
+        for ln, attn, mln, mlp in zip(
+            self.prefix_ln, self.prefix_attn, self.prefix_mlp_ln, self.prefix_mlp
+        ):
+            toks = toks + attn(ln(toks), causal=True)
+            toks = toks + mlp(mln(toks))
+        return self.prefix_norm(toks[:, 1:])  # drop the 0-th (state) output
+
+    def forward(self, anchor: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+        assert anchor.dim() == 3, f"anchor (B, N, D), got {tuple(anchor.shape)}"
+        B, N, _ = anchor.shape
+        H = act_emb.shape[1]
+        if H > self.max_horizon:
+            raise ValueError(f"horizon {H} exceeds max_horizon {self.max_horizon}")
+        z = self.input_proj(anchor) + self.pos_spatial[:, :N]  # (B, N, hidden)
+        state_tok = self.state_mlp(z.mean(dim=1))              # (B, hidden)
+        prefix = self._encode_prefixes(state_tok, act_emb)     # (B, H, hidden)
+        c_trunk = self.adaln_trunk(prefix)                     # (B, H, adaln_rank)
+        x = z.unsqueeze(1).expand(B, H, N, self.hidden_dim).contiguous()
+        for blk in self.blocks:
+            x = blk(x, c_trunk)
+        x = self.norm_out(x)
+        out: torch.Tensor = self.output_proj(x)
+        return out  # (B, H, N, output_dim)
+
+
+__all__ = [
+    "ARPredictor",
+    "PatchARPredictor",
+    "PatchBlock",
+    "PrefixPatchPredictor",
+]

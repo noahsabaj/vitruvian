@@ -33,7 +33,11 @@ from vitruvian.models.backbones import (
     DINOv3PatchBackbone,
 )
 from vitruvian.models.jepa import JEPA
-from vitruvian.models.predictors import ARPredictor, PatchARPredictor
+from vitruvian.models.predictors import (
+    ARPredictor,
+    PatchARPredictor,
+    PrefixPatchPredictor,
+)
 
 BACKBONES: dict[str, type[Backbone]] = {
     "dinov3-cls": DINOv3ClsBackbone,
@@ -46,6 +50,7 @@ BACKBONES: dict[str, type[Backbone]] = {
 PREDICTORS: dict[str, type[nn.Module]] = {
     "ar": ARPredictor,
     "patch-ar": PatchARPredictor,
+    "prefix-patch": PrefixPatchPredictor,
 }
 
 
@@ -69,10 +74,10 @@ def _build_predictor(
     if name not in PREDICTORS:
         raise KeyError(f"unknown predictor {name!r}; known: {sorted(PREDICTORS)}")
     kwargs = dict(cfg.get("kwargs", {}))
-    if name == "patch-ar" and "num_patches" not in kwargs:
+    if name in ("patch-ar", "prefix-patch") and "num_patches" not in kwargs:
         if n_patches is None:
             raise ValueError(
-                "patch-ar predictor needs num_patches; either set it in "
+                f"{name} predictor needs num_patches; either set it in "
                 "cfg.predictor.kwargs or use a patch-shaped backbone"
             )
         kwargs["num_patches"] = int(n_patches)
