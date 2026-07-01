@@ -87,7 +87,7 @@ def _run_one(
 
     with bf16_autocast(), torch.no_grad():
         goal_pixel = torch.from_numpy(
-            load_goal_pixel(Path(cfg.h5_path), 0, cfg.goal_ep)
+            load_goal_pixel(Path(cfg.h5_path).expanduser(), 0, cfg.goal_ep)
         )
         # Plain visual goal embedding — the world-model target is
         # visual-only, so the planner cost and this cosine diagnostic
