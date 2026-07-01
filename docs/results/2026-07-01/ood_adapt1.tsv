@@ -1,0 +1,13 @@
+scenario	h5	goal_ep	sigma	seed	mean_cos	cos_range	max_cos	walk_completed	wall_s
+ood-fwd	~/.stable_worldmodel/g1_ood_v1.h5	12	0.0	0	0.8711	0.3769	0.9890	1	22.2
+ood-fwd	~/.stable_worldmodel/g1_ood_v1.h5	12	0.02	0	0.9138	0.2638	0.9922	1	15.1
+ood-back	~/.stable_worldmodel/g1_ood_v1.h5	37	0.0	0	0.9444	0.1764	0.9910	1	15.1
+ood-back	~/.stable_worldmodel/g1_ood_v1.h5	37	0.02	0	0.9276	0.1255	0.9887	1	15.6
+ood-latL	~/.stable_worldmodel/g1_ood_v1.h5	62	0.0	0	0.9570	0.1274	0.9846	1	16.5
+ood-latL	~/.stable_worldmodel/g1_ood_v1.h5	62	0.02	0	0.9074	0.3948	0.9809	1	15.6
+ood-latR	~/.stable_worldmodel/g1_ood_v1.h5	87	0.0	0	0.9123	0.2168	0.9899	1	15.6
+ood-latR	~/.stable_worldmodel/g1_ood_v1.h5	87	0.02	0	0.8289	0.4770	0.9919	1	15.6
+ood-spin	~/.stable_worldmodel/g1_ood_v1.h5	112	0.0	0	0.9600	0.1036	0.9885	1	15.7
+ood-spin	~/.stable_worldmodel/g1_ood_v1.h5	112	0.02	0	0.9117	0.3015	0.9933	1	16.2
+ood-combo	~/.stable_worldmodel/g1_ood_v1.h5	137	0.0	0	0.9526	0.1131	0.9852	1	15.6
+ood-combo	~/.stable_worldmodel/g1_ood_v1.h5	137	0.02	0	0.9048	0.2190	0.9815	1	13.8
