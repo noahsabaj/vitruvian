@@ -55,10 +55,11 @@ class DINOv3ClsBackbone(nn.Module):
     """Frozen DINOv3 ViT-B/16 CLS-token encoder.
 
     Input:  ``pixels (B, T, 3, H, W)`` uint8 or float32 in ``[0, 1]``.
-    Output: ``emb (B, T, D_out)`` float32 (cast back from FP16 internal).
+    Output: ``emb (B, T, D_out)`` float32 (cast back from BF16 internal).
 
-    The internal DINOv3 runs in FP16 for VRAM headroom (~500 MB saved vs
-    FP32); the CLS output is cast to float32 before returning so it can
+    The internal DINOv3 runs in BF16 for VRAM headroom (~500 MB saved vs
+    FP32, same range as FP32); the CLS output is cast to float32 before
+    returning so it can
     participate in autograd for the downstream trainable modules.
     """
 
@@ -67,7 +68,7 @@ class DINOv3ClsBackbone(nn.Module):
         model_id: str = DEFAULT_DINOV3_ID,
         *,
         device: str = "cuda",
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bfloat16,
         freeze: bool = True,
         lazy: bool = False,
     ) -> None:
@@ -187,9 +188,9 @@ class DINOv3PatchBackbone(nn.Module):
             stride=2) and ``D_out = encoder.hidden_size`` (768 for
             ViT-B/16).
 
-    The encoder runs in FP16 for VRAM; the returned tensor is cast to
+    The encoder runs in BF16 for VRAM; the returned tensor is cast to
     float32 so downstream modules (trainable projection, predictor) can
-    hold autograd state without FP16 precision loss.
+    hold autograd state without BF16 precision loss.
     """
 
     def __init__(
@@ -197,7 +198,7 @@ class DINOv3PatchBackbone(nn.Module):
         model_id: str = DEFAULT_DINOV3_ID,
         *,
         device: str = "cuda",
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bfloat16,
         freeze: bool = True,
         spatial_stride: int = 2,
         lazy: bool = False,
