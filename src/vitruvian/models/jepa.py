@@ -174,6 +174,9 @@ class JEPA(nn.Module):
         Writes ``info["predicted_emb"]`` with shape
         ``(B, S, T_total, ...)``.
         """
+        if self.is_prefix_predictor:
+            return self._rollout_prefix(info, action_sequence, history_size)
+
         if "emb" in info:
             emb_init = info["emb"]
             H = emb_init.size(2)
@@ -228,6 +231,58 @@ class JEPA(nn.Module):
 
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
         info["predicted_emb"] = pred_rollout
+        return info
+
+    def _rollout_prefix(
+        self,
+        info: dict[str, Any],
+        action_sequence: torch.Tensor,
+        history_size: int,
+    ) -> dict[str, Any]:
+        """Fast-LeWM rollout: anchor on the last history frame and predict all
+        ``n_future`` latents in parallel (one pass), so plan-time rollouts don't
+        chain — no compounding error. Blocks of ``max_horizon`` are chained only
+        when the planning horizon exceeds it (re-anchoring on the last
+        prediction). Output matches the AR ``rollout`` contract: ``predicted_emb``
+        of shape ``(B, S, H + n_future, ...)`` whose ``[..., idx]`` for
+        ``idx >= H`` is the prediction of frame ``idx`` (proprio is unobserved at
+        plan time, so no ``state_cond`` — the model was trained proprio-robust)."""
+        B, S, T = action_sequence.shape[:3]
+        if "emb" in info:
+            emb_init = info["emb"]  # (B, S, H, N, D)
+        else:
+            assert "pixels" in info, (
+                "rollout() needs either info['emb'] (pre-encoded) or "
+                "info['pixels']"
+            )
+            _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+            emb_single = self.encode(_init)["emb"]  # (B, H, N, D)
+            emb_init = emb_single.unsqueeze(1).expand(
+                B, S, *emb_single.shape[1:]
+            )
+        H = emb_init.size(2)
+        n_future = T - H
+        max_h = int(self.predictor.max_horizon)
+
+        anchor = rearrange(emb_init[:, :, -1], "b s ... -> (b s) ...")  # (BS,N,D)
+        # Actions from the anchor frame forward: a_{H-1} .. a_{H-1+n_future-1}.
+        fut = action_sequence[:, :, H - 1 : H - 1 + n_future]
+        fut = rearrange(fut, "b s ... -> (b s) ...")  # (BS, n_future, A)
+
+        preds: list[torch.Tensor] = []
+        cur = anchor
+        start = 0
+        while start < n_future:
+            blk = min(max_h, n_future - start)
+            act_emb = self.action_encoder(fut[:, start : start + blk])
+            blk_pred = self.predict_prefix(cur, act_emb)  # (BS, blk, N, D)
+            preds.append(blk_pred)
+            cur = blk_pred[:, -1]  # re-anchor for the next block (if any)
+            start += blk
+
+        emb_bs = rearrange(emb_init, "b s ... -> (b s) ...")  # (BS, H, N, D)
+        full = torch.cat([emb_bs, *preds], dim=1)  # (BS, H + n_future, N, D)
+        info["predicted_emb"] = rearrange(full, "(b s) ... -> b s ...", b=B, s=S)
         return info
 
 

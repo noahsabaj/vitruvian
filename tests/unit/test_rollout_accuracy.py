@@ -39,6 +39,20 @@ def _v5_cfg() -> dict:
     }
 
 
+def _v6_cfg(max_horizon: int = 12) -> dict:
+    # Fast-LeWM prefix predictor, otherwise matching _v5_cfg's widths.
+    cfg = _v5_cfg()
+    cfg["predictor"] = {
+        "name": "prefix-patch",
+        "kwargs": {
+            "depth": 2, "heads": 4, "mlp_dim": 256, "input_dim": 128,
+            "hidden_dim": 128, "output_dim": 128, "dim_head": 32,
+            "prefix_depth": 2, "adaln_rank": 64, "max_horizon": max_horizon,
+        },
+    }
+    return cfg
+
+
 def _dataset(synthetic_h5) -> G1PatchSeqDataset:
     # Fake raw patch cache matching the fake backbone's 768-d, 49-patch output.
     total = 50  # 2 episodes x 25 steps (see conftest.synthetic_h5)
@@ -102,3 +116,32 @@ def test_action_sensitivity_structural(registry_with_fakes, synthetic_h5) -> Non
         assert np.isfinite(res[k]), f"{k} not finite"
     assert res["local_spread"] >= 0.0 and res["diverse_spread"] >= 0.0
     assert res["local_ratio"] >= 0.0 and res["diverse_ratio"] >= 0.0
+
+
+def test_rollout_accuracy_prefix_predictor(registry_with_fakes, synthetic_h5) -> None:
+    """rollout_accuracy runs through jepa.rollout, which routes to the parallel
+    prefix path for a Fast-LeWM predictor — same output contract as AR, so the
+    Q1a metric works unchanged (history_size=1 anchor)."""
+    m = build_jepa(_v6_cfg(max_horizon=12))
+    ds = _dataset(synthetic_h5)
+    res = rollout_accuracy(
+        m, ds.patches, ds.ep_offset, ds.ep_len, ds.action, [0, 1],
+        history_size=1, max_horizon=10, device="cpu",
+    )
+    assert res["n_episodes"] == 2
+    assert len(res["per_horizon"]) == 10  # frames 1..10 all scored
+    for row in res["per_horizon"]:
+        assert row["n"] == 2
+        assert -1.0 <= row["model_cos"] <= 1.0 and row["model_mse"] >= 0.0
+
+
+def test_rollout_accuracy_prefix_chaining(registry_with_fakes, synthetic_h5) -> None:
+    """When the eval horizon exceeds the predictor's max_horizon, the prefix
+    rollout block-chains (re-anchoring) and still yields every horizon."""
+    m = build_jepa(_v6_cfg(max_horizon=4))  # < eval horizon 9 -> 4+4+1 blocks
+    ds = _dataset(synthetic_h5)
+    res = rollout_accuracy(
+        m, ds.patches, ds.ep_offset, ds.ep_len, ds.action, [0, 1],
+        history_size=1, max_horizon=9, device="cpu",
+    )
+    assert len(res["per_horizon"]) == 9
