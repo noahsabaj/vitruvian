@@ -1,0 +1,22 @@
+# Q1b — OOD goal collection. Commands BEYOND the diverse training grid
+# (vx∈{-0.5,0,0.5}, vy∈{-0.3,0,0.3}, yaw∈{-0.3,0,0.3}), so the states and
+# dynamics here are out-of-distribution for the world model (it never trained
+# on them). Goal images pulled from these episodes test (a) whether MPPI+WM
+# can plan to states it never saw, and (b) whether AdaJEPA's test-time
+# adaptation helps MORE under real distribution shift (its thesis).
+#
+# `mode` != narrow/diverse → the collector uses the explicit `commands` list.
+mode: ood
+out_h5: ~/.stable_worldmodel/g1_ood_v1.h5
+episodes_per_command: 25
+episode_steps: 200
+chunk_size: 5
+seed: 0
+img_size: 224
+commands:
+  - {vel_x: 1.0, vel_y: 0.0, yaw_rate: 0.0}    # fast forward   (2x grid vx)
+  - {vel_x: -0.8, vel_y: 0.0, yaw_rate: 0.0}   # backward       (beyond -0.5)
+  - {vel_x: 0.0, vel_y: 0.6, yaw_rate: 0.0}    # strong left    (2x grid vy)
+  - {vel_x: 0.0, vel_y: -0.6, yaw_rate: 0.0}   # strong right
+  - {vel_x: 0.0, vel_y: 0.0, yaw_rate: 0.6}    # fast spin      (2x grid yaw)
+  - {vel_x: 0.7, vel_y: 0.4, yaw_rate: 0.4}    # combined extreme

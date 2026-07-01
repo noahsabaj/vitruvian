@@ -1,0 +1,21 @@
+# Q1b — MPPI planning toward OOD goals (commands beyond the WM's training grid).
+# Goals are mid-episode frames from g1_ood_v1.h5 (one per OOD command block of
+# 25 episodes). Run frozen vs --adapt to test the AdaJEPA lift under real shift.
+ckpt: ~/.vitruvian/jepa_v5/best.pt
+policy_ckpt: checkpoints/m1-g1-full.pkl
+vel_cmd: [0.5, 0.0, 0.0]
+out_dir: /tmp/vitruvian/eval_ood
+
+runs:
+  - {scenario: ood-fwd,   h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 12,  sigma: 0.0,  seed: 0}
+  - {scenario: ood-fwd,   h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 12,  sigma: 0.02, seed: 0}
+  - {scenario: ood-back,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 37,  sigma: 0.0,  seed: 0}
+  - {scenario: ood-back,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 37,  sigma: 0.02, seed: 0}
+  - {scenario: ood-latL,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 62,  sigma: 0.0,  seed: 0}
+  - {scenario: ood-latL,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 62,  sigma: 0.02, seed: 0}
+  - {scenario: ood-latR,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 87,  sigma: 0.0,  seed: 0}
+  - {scenario: ood-latR,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 87,  sigma: 0.02, seed: 0}
+  - {scenario: ood-spin,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 112, sigma: 0.0,  seed: 0}
+  - {scenario: ood-spin,  h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 112, sigma: 0.02, seed: 0}
+  - {scenario: ood-combo, h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 137, sigma: 0.0,  seed: 0}
+  - {scenario: ood-combo, h5_path: ~/.stable_worldmodel/g1_ood_v1.h5, goal_ep: 137, sigma: 0.02, seed: 0}
