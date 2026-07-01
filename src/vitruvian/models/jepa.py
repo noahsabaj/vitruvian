@@ -130,6 +130,25 @@ class JEPA(nn.Module):
         out: torch.Tensor = self.predictor(emb, act_emb)
         return out
 
+    @property
+    def is_prefix_predictor(self) -> bool:
+        """True for a Fast-LeWM :class:`PrefixPatchPredictor` (parallel
+        action-prefix prediction) vs an autoregressive predictor."""
+        return hasattr(self.predictor, "max_horizon")
+
+    def predict_prefix(
+        self,
+        anchor: torch.Tensor,
+        act_emb: torch.Tensor,
+        state_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fast-LeWM parallel prediction: given an anchor latent ``(B, N, D)``
+        and per-step action embeddings ``(B, H, hidden)``, return all horizons
+        ``(B, H, N, D)`` in one pass. ``state_cond`` (e.g. anchor proprio) is
+        added to the predictor's state token."""
+        out: torch.Tensor = self.predictor(anchor, act_emb, state_cond)
+        return out
+
     def rollout(
         self,
         info: dict[str, Any],

@@ -276,4 +276,81 @@ def prediction_loss(
     }
 
 
-__all__ = ["prediction_loss", "sigreg_loss", "vicreg_std_loss"]
+def prefix_prediction_loss(
+    model: _JEPALike,
+    batch: dict[str, torch.Tensor],
+    *,
+    history_size: int,
+    num_preds: int,
+    rollout_weight: float = 1.0,
+    reg_weight: float = 0.0,
+    proprio_dropout: float = 0.0,
+) -> dict[str, Any]:
+    """Fast-LeWM (arXiv:2606.26217) dense action-prefix loss.
+
+    The anchor is the last of the ``history_size`` context frames — Fast-LeWM
+    anchors *every* prediction on the OBSERVED latent, so ``history_size=1`` is
+    the canonical setting. From that single anchor the predictor emits all
+    ``num_preds`` future latents in one pass, each conditioned on the action
+    *prefix* to that horizon; we supervise every horizon densely against the
+    real future frames. No autoregressive chaining → no compounding error (the
+    M6 fix for the Q1a horizon-error growth).
+
+    Requires ``model.predict_prefix`` and a patch batch (``"patches"``). The
+    anchor's proprio is folded in as ``state_cond`` (per-sample dropout keeps
+    the model robust if it is ever absent). For logging parity with
+    :func:`prediction_loss`, the 1-step term is reported as ``pred_loss`` and
+    horizons ≥2 as ``rollout_loss``.
+    """
+    emb, emb_for_reg = _compute_emb(model, batch)  # (B, T, N, hidden)
+    if emb.dim() != 4:
+        raise ValueError(
+            "prefix_prediction_loss needs a patch batch (B, T, N, D)"
+        )
+    a0 = int(history_size) - 1  # anchor frame index
+    k = int(num_preds)
+    anchor = emb[:, a0]  # (B, N, hidden)
+    targets = emb[:, a0 + 1 : a0 + 1 + k]  # (B, k, N, hidden)
+    actions = batch["action"][:, a0 : a0 + k]  # (B, k, A): drive anchor -> +k
+    act_emb = model.action_encoder(actions)  # (B, k, hidden)
+
+    state_cond: torch.Tensor | None = None
+    pe = model.proprio_encoder
+    if pe is not None and "proprio" in batch:
+        prop0 = batch["proprio"][:, a0].float()  # (B, P): anchor proprio
+        if proprio_dropout > 0.0 and getattr(model, "training", False):
+            keep = (
+                torch.rand(prop0.shape[0], 1, device=prop0.device)
+                >= proprio_dropout
+            ).to(prop0.dtype)
+            prop0 = prop0 * keep
+        state_cond = pe(prop0)  # (B, hidden)
+
+    pred = model.predict_prefix(anchor, act_emb, state_cond)  # (B, k, N, hidden)
+
+    pred_loss = (pred[:, :1] - targets[:, :1]).pow(2).mean()
+    if rollout_weight > 0 and k >= 2:
+        rollout_loss = (pred[:, 1:] - targets[:, 1:]).pow(2).mean()
+    else:
+        rollout_loss = torch.zeros((), device=emb.device)
+    reg_loss = (
+        sigreg_loss(emb_for_reg)
+        if reg_weight > 0
+        else torch.zeros((), device=emb.device)
+    )
+    total = pred_loss + rollout_weight * rollout_loss + reg_weight * reg_loss
+    return {
+        "loss": total,
+        "pred_loss": pred_loss.detach(),
+        "rollout_loss": rollout_loss.detach(),
+        "reg_loss": reg_loss.detach(),
+        "n_rollout_steps": max(0, k - 1),
+    }
+
+
+__all__ = [
+    "prediction_loss",
+    "prefix_prediction_loss",
+    "sigreg_loss",
+    "vicreg_std_loss",
+]

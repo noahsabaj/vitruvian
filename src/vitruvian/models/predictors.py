@@ -380,7 +380,12 @@ class PrefixPatchPredictor(nn.Module):
             toks = toks + mlp(mln(toks))
         return self.prefix_norm(toks[:, 1:])  # drop the 0-th (state) output
 
-    def forward(self, anchor: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        anchor: torch.Tensor,
+        act_emb: torch.Tensor,
+        state_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         assert anchor.dim() == 3, f"anchor (B, N, D), got {tuple(anchor.shape)}"
         B, N, _ = anchor.shape
         H = act_emb.shape[1]
@@ -388,6 +393,8 @@ class PrefixPatchPredictor(nn.Module):
             raise ValueError(f"horizon {H} exceeds max_horizon {self.max_horizon}")
         z = self.input_proj(anchor) + self.pos_spatial[:, :N]  # (B, N, hidden)
         state_tok = self.state_mlp(z.mean(dim=1))              # (B, hidden)
+        if state_cond is not None:  # e.g. proprio conditioning at the anchor
+            state_tok = state_tok + state_cond
         prefix = self._encode_prefixes(state_tok, act_emb)     # (B, H, hidden)
         c_trunk = self.adaln_trunk(prefix)                     # (B, H, adaln_rank)
         x = z.unsqueeze(1).expand(B, H, N, self.hidden_dim).contiguous()

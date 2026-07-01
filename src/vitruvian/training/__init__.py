@@ -11,6 +11,7 @@ from vitruvian.training.iql import (
 )
 from vitruvian.training.losses import (
     prediction_loss,
+    prefix_prediction_loss,
     sigreg_loss,
     vicreg_std_loss,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "ema_update",
     "expectile_loss",
     "prediction_loss",
+    "prefix_prediction_loss",
     "sigreg_loss",
     "vicreg_std_loss",
 ]

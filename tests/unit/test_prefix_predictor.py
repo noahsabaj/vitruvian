@@ -57,15 +57,15 @@ def test_prefix_encoder_is_causal() -> None:
     assert not torch.allclose(base[:, 4], pert[:, 4])
 
 
-def test_build_prefix_patch_via_registry(registry_with_fakes) -> None:
-    cfg = {
+def _v6_cfg(max_horizon: int = 8) -> dict:
+    return {
         "backbone": {"name": "dinov3-patch", "kwargs": {}},
         "predictor": {
             "name": "prefix-patch",
             "kwargs": {
                 "depth": 2, "heads": 4, "mlp_dim": 256, "input_dim": 128,
                 "hidden_dim": 128, "output_dim": 128, "dim_head": 32,
-                "prefix_depth": 2, "adaln_rank": 64, "max_horizon": 8,
+                "prefix_depth": 2, "adaln_rank": 64, "max_horizon": max_horizon,
             },
         },
         "action_encoder": {
@@ -76,6 +76,31 @@ def test_build_prefix_patch_via_registry(registry_with_fakes) -> None:
         },
         "patch_projector": {"kwargs": {"in_dim": 768, "out_dim": 128}},
     }
-    m = build_jepa(cfg)
+
+
+def test_build_prefix_patch_via_registry(registry_with_fakes) -> None:
+    m = build_jepa(_v6_cfg())
     assert m.predictor.num_patches == 49  # injected from the patch backbone
     assert m.emb_dim == 128
+    assert m.is_prefix_predictor  # selects the dense prefix loss in train.py
+
+
+def test_prefix_prediction_loss_and_backward(registry_with_fakes) -> None:
+    from vitruvian.training import prefix_prediction_loss
+
+    m = build_jepa(_v6_cfg(max_horizon=8))
+    B, T, N = 2, 9, 49  # history_size=1 + num_preds=8 -> seq_len 9
+    batch = {
+        "patches": torch.randn(B, T, N, 768),
+        "action": torch.randn(B, T, 29),
+        "proprio": torch.randn(B, T, 103),
+    }
+    out = prefix_prediction_loss(
+        m, batch, history_size=1, num_preds=8, reg_weight=1.0, proprio_dropout=0.25
+    )
+    assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    assert out["n_rollout_steps"] == 7  # horizons 2..8
+    assert out["reg_loss"] > 0.0  # SIGReg active
+    out["loss"].backward()
+    grads = [p.grad for p in m.predictor.parameters() if p.grad is not None]
+    assert grads, "predictor must receive gradients from the prefix loss"

@@ -31,7 +31,12 @@ from vitruvian.data import (
     episode_aware_split,
 )
 from vitruvian.models import build_jepa
-from vitruvian.training import JEPATrainer, TrainerConfig, prediction_loss
+from vitruvian.training import (
+    JEPATrainer,
+    TrainerConfig,
+    prediction_loss,
+    prefix_prediction_loss,
+)
 from vitruvian.utils import load_config
 
 
@@ -226,8 +231,19 @@ def main() -> None:
     )
     jepa = build_jepa(jepa_cfg).to(device)
 
+    # Fast-LeWM (prefix-patch) predictors need the dense action-prefix loss;
+    # autoregressive predictors use the teacher-forced + k-step rollout loss.
+    # Both share the same call signature.
+    base_loss = (
+        prefix_prediction_loss if jepa.is_prefix_predictor else prediction_loss
+    )
+    if jepa.is_prefix_predictor:
+        print(
+            f"[loss]   Fast-LeWM dense prefix loss "
+            f"(anchor=frame {history_size - 1}, {num_preds} horizons)"
+        )
     loss_fn = partial(
-        prediction_loss,
+        base_loss,
         history_size=history_size,
         num_preds=num_preds,
         rollout_weight=rollout_weight,

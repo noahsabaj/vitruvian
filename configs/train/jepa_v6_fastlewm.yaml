@@ -1,0 +1,73 @@
+# M6 JEPAv6 recipe: frozen DINOv3 + trainable patch head + Fast-LeWM
+# PrefixPatchPredictor (action-prefix parallel prediction; arXiv:2606.26217).
+# Same frozen prior + projector + proprio-conditioning + SIGReg as v5; only the
+# predictor + loss change (autoregressive -> dense parallel prefix). The anchor
+# is the single current frame (history_size=1); the predictor emits all 16
+# horizons in one pass, so training and planning never chain -> no compounding
+# rollout error (the M6 fix for the Q1a horizon-error growth).
+run_name: jepa_v6_fastlewm
+out_dir: ~/.vitruvian/jepa_v6_fastlewm
+
+jepa:
+  backbone:
+    name: dinov3-patch
+    kwargs:
+      model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
+      spatial_stride: 2
+      freeze: true
+  patch_projector:
+    kwargs:
+      in_dim: 768
+      out_dim: 256
+  proprio_encoder:
+    kwargs:
+      in_dim: 103
+      hidden: 256
+      out_dim: 256
+      norm_fn: null
+  action_encoder:
+    kwargs:
+      action_dim: 29
+      frameskip: 1
+      smoothed_dim: 10
+      emb_dim: 256
+  predictor:
+    name: prefix-patch
+    kwargs:
+      depth: 6
+      heads: 8
+      mlp_dim: 1024
+      input_dim: 256
+      hidden_dim: 256
+      output_dim: 256
+      dim_head: 32
+      prefix_depth: 3       # action-prefix causal encoder depth
+      dropout: 0.1
+      adaln_rank: 128
+      max_horizon: 16        # matches loss.num_preds / the Q1a eval horizon
+
+trainer:
+  epochs: 3
+  batch_size: 16
+  lr: 1.0e-4
+  lr_floor: 3.0e-5
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  bf16: true
+  compile_predictor: false   # Studio Triton toolchain is broken; run eager
+  num_workers: 4
+  val_frac: 0.05
+  seed: 0
+
+loss:
+  history_size: 1          # Fast-LeWM anchors on the single current frame
+  num_preds: 16            # dense supervision over 16 parallel horizons
+  rollout_weight: 1.0      # weight on horizons >=2 (vs the 1-step term)
+  reg_weight: 1.0          # SIGReg isotropic-Gaussian anti-collapse (LeJEPA)
+  proprio_dropout: 0.25    # anchor proprio IS observed at plan time; light reg
+
+data:
+  h5: ~/.stable_worldmodel/g1_diverse_v1.h5
+  cache_dir: ~/.vitruvian/m4f_v5/cache
+  cache_mode: patch2
+  model_id: facebook/dinov3-vitb16-pretrain-lvd1689m
