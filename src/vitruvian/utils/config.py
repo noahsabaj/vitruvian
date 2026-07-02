@@ -35,11 +35,22 @@ def _apply_override(cfg: dict[str, Any], dotted: str) -> None:
         )
     key, _, value = dotted.partition("=")
     parts = key.split(".")
-    node = cfg
+    node: Any = cfg
     for p in parts[:-1]:
-        if p not in node or not isinstance(node[p], dict):
-            node[p] = {}
-        node = node[p]
+        existing = node.get(p) if isinstance(node, dict) else None
+        if existing is None:
+            new_node: dict[str, Any] = {}
+            node[p] = new_node
+            node = new_node
+        elif isinstance(existing, dict):
+            node = existing
+        else:
+            # Refuse to silently overwrite a scalar/list with a mapping — that
+            # almost always means the override path has a typo.
+            raise ValueError(
+                f"override {dotted!r}: cannot descend into {'.'.join(parts[:parts.index(p)+1])!r} "
+                f"because it is a {type(existing).__name__}, not a mapping"
+            )
     node[parts[-1]] = _coerce_scalar(value)
 
 

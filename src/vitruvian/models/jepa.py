@@ -2,10 +2,10 @@
 # Copyright 2026 The Vitruvian Authors
 """Unified JEPA composer.
 
-Subsumes the three milestone-specific composers (v3 LeWM, v4 DINOv3-CLS,
-v5 DINOv3-patch) into one :class:`JEPA` class that is shape-polymorphic
-over the backbone output — a 3-D ``(B, T, D)`` flat latent or a 4-D
-``(B, T, N, D)`` patch latent.
+Subsumes the milestone-specific composers (v3 LeWM, v4 DINOv3-CLS,
+v5 DINOv3-patch, v6 Fast-LeWM patch) into one :class:`JEPA` class that
+is shape-polymorphic over the backbone output — a 3-D ``(B, T, D)`` flat
+latent or a 4-D ``(B, T, N, D)`` patch latent.
 
 The code path per forward:
 
@@ -19,29 +19,25 @@ The code path per forward:
    target stays visual-only, so the planner's goal is a plain image
    embedding and the MPPI cost lives in one space (see
    :mod:`vitruvian.training.losses`).
-4. ``predictor`` autoregresses over the embedding given per-frame
-   conditioning ``c``.
+4. The ``predictor`` maps the embedding to the next latent(s) given the
+   per-frame conditioning ``c``. Two predictor families are supported
+   behind one interface: an **autoregressive** predictor (v3/v4/v5, one
+   step per call) and the **Fast-LeWM** parallel prefix predictor (v6,
+   all horizons from one anchor in a single pass; see
+   :meth:`JEPA.predict_prefix` / :meth:`JEPA._rollout_prefix`).
 
 The rollout API is identical across configurations so
 :class:`vitruvian.planning.mppi.MPPIPlanner` does not care which JEPA
-shape is behind it.
+shape (or predictor family) is behind it.
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-
-_T = TypeVar("_T")
-
-
-def _detach_clone(v: _T) -> _T:
-    if torch.is_tensor(v):
-        return v.detach().clone()  # type: ignore[return-value]
-    return v
 
 
 class _BackboneLike(Protocol):
@@ -56,9 +52,12 @@ class JEPA(nn.Module):
     Args:
         backbone: Frozen visual encoder. Must expose ``encode(pixels)``
             returning either ``(B, T, D)`` or ``(B, T, N, D)``.
-        predictor: Autoregressive next-step predictor. Must accept
-            ``(x, c)`` with ``x`` matching the embedding rank (3-D or
-            4-D) and ``c`` the per-frame conditioning.
+        predictor: Next-step predictor. An autoregressive predictor
+            (v3/v4/v5) accepts ``(x, c)`` with ``x`` matching the
+            embedding rank (3-D or 4-D) and ``c`` the per-frame
+            conditioning; a Fast-LeWM prefix predictor (v6) instead
+            exposes ``max_horizon`` and is driven via
+            :meth:`predict_prefix` / :meth:`_rollout_prefix`.
         action_encoder: Maps raw actions to per-frame conditioning.
         proprio_encoder: Optional MLP over proprioception. Used by the
             training loss as predictor *conditioning* (summed with the
@@ -193,7 +192,7 @@ class JEPA(nn.Module):
         n_steps = T - H
 
         if "emb" in info:
-            emb = info["emb"] = emb_init
+            emb = emb_init  # already ``(B, S, H, ...)``
         else:
             _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
             _init = self.encode(_init)
@@ -205,7 +204,6 @@ class JEPA(nn.Module):
                 emb = info["emb"] = (
                     emb_single.unsqueeze(1).expand(B, S, -1, -1, -1)
                 )
-            _init = {k: _detach_clone(v) for k, v in _init.items()}
 
         emb = rearrange(emb, "b s ... -> (b s) ...").clone()
         act = rearrange(act_0, "b s ... -> (b s) ...")
@@ -243,10 +241,19 @@ class JEPA(nn.Module):
         ``n_future`` latents in parallel (one pass), so plan-time rollouts don't
         chain — no compounding error. Blocks of ``max_horizon`` are chained only
         when the planning horizon exceeds it (re-anchoring on the last
-        prediction). Output matches the AR ``rollout`` contract: ``predicted_emb``
-        of shape ``(B, S, H + n_future, ...)`` whose ``[..., idx]`` for
-        ``idx >= H`` is the prediction of frame ``idx`` (proprio is unobserved at
-        plan time, so no ``state_cond`` — the model was trained proprio-robust)."""
+        prediction).
+
+        Output matches the AR ``rollout`` contract exactly: ``predicted_emb`` of
+        shape ``(B, S, T + 1, ...)`` = ``H`` observed frames followed by
+        ``n_future = T - H + 1`` predictions, where prediction ``idx >= H`` is
+        frame ``idx`` driven by action ``a_{idx-1}``. Consuming all ``T`` actions
+        (the anchor action ``a_{H-1}`` through ``a_{T-1}``) is what keeps the
+        terminal — the frame MPPI scores — sensitive to the last planned action,
+        just like the AR path's extra final step.
+
+        Proprio is unobserved at plan time, so no ``state_cond`` is passed; the
+        model is trained proprio-robust (per-frame proprio dropout, see
+        :func:`vitruvian.training.losses.prefix_prediction_loss`)."""
         B, S, T = action_sequence.shape[:3]
         if "emb" in info:
             emb_init = info["emb"]  # (B, S, H, N, D)
@@ -261,12 +268,17 @@ class JEPA(nn.Module):
                 B, S, *emb_single.shape[1:]
             )
         H = emb_init.size(2)
-        n_future = T - H
-        max_h = int(self.predictor.max_horizon)
+        # +1 so the anchor action ``a_{H-1}`` and every later action drive a
+        # prediction: n_future predictions from H observed frames == T+1 total,
+        # matching the AR contract. (Was ``T - H``, which silently dropped the
+        # last action ``a_{T-1}`` and returned only T frames, making MPPI's final
+        # planned action cost-invisible with a v6 checkpoint.)
+        n_future = T - H + 1
+        max_h = int(getattr(self.predictor, "max_horizon"))
 
         anchor = rearrange(emb_init[:, :, -1], "b s ... -> (b s) ...")  # (BS,N,D)
-        # Actions from the anchor frame forward: a_{H-1} .. a_{H-1+n_future-1}.
-        fut = action_sequence[:, :, H - 1 : H - 1 + n_future]
+        # Actions from the anchor frame forward: a_{H-1} .. a_{T-1}.
+        fut = action_sequence[:, :, H - 1 :]
         fut = rearrange(fut, "b s ... -> (b s) ...")  # (BS, n_future, A)
 
         preds: list[torch.Tensor] = []
@@ -287,14 +299,16 @@ class JEPA(nn.Module):
 
 
 class PlannerBackbone(nn.Module):
-    """Planner-facing wrapper exposing the ``encode()`` path **including**
-    the optional patch projector but **excluding** proprio.
+    """Planner-facing wrapper exposing ``backbone.encode`` → (optional)
+    ``patch_projector`` as a single ``encode()`` call.
 
-    :class:`JEPA.encode` bakes proprio into the embedding when present,
-    but the planner's :class:`EncoderHistory` encodes from pixels alone.
-    This wrapper applies ``backbone.encode`` → (optional)
-    ``patch_projector`` so the history buffer produces the same
-    projected embedding the predictor consumes during rollout.
+    The predictor consumes the *projected* latent (backbone → projector),
+    so the planner's :class:`EncoderHistory` must produce that same
+    projected embedding from pixels. :class:`JEPA.encode` returns the
+    projected latent but also stashes ``act_emb`` and mutates ``info``;
+    this wrapper is the minimal pixels-in / projected-latent-out view the
+    history buffer needs. Proprio never enters — the prediction target is
+    visual-only (proprio is train-time predictor conditioning only).
     """
 
     def __init__(self, jepa: JEPA) -> None:

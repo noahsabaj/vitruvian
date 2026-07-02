@@ -27,18 +27,23 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
 
 from vitruvian.planning.costs import CostFn, MSECost
 
 
-class MPPIPlanner(nn.Module):
-    """MPPI planner over primitive joint-torque actions."""
+class MPPIPlanner:
+    """MPPI planner over primitive joint-torque actions.
+
+    A plain object (not an ``nn.Module``): it holds references to a JEPA and
+    a backbone but has no parameters of its own, so registering them as
+    submodules would only make ``state_dict()`` accidentally serialize the
+    entire world model.
+    """
 
     def __init__(
         self,
-        jepa: nn.Module,
-        backbone: nn.Module,
+        jepa: Any,
+        backbone: Any,
         subgoal_emb: torch.Tensor,
         *,
         cost_fn: CostFn | None = None,
@@ -52,12 +57,10 @@ class MPPIPlanner(nn.Module):
         action_low: float = -1.0,
         action_high: float = 1.0,
         device: str = "cuda",
+        seed: int | None = None,
     ) -> None:
-        super().__init__()
-        # Any: JEPA composer exposes .rollout(info, ...) with a dynamic
-        # dict contract; backbone exposes .encode() and .output_dim as
-        # duck-typed attrs. Both cases are Tensor-vs-Module narrowed by
-        # nn.Module's dynamic-attr access unless we skip typing them.
+        # jepa exposes .rollout(info, ...) with a dynamic dict contract;
+        # backbone exposes .encode() and .output_dim as duck-typed attrs.
         self.jepa: Any = jepa
         self.backbone = backbone
         self.action_dim = int(action_dim)
@@ -70,6 +73,17 @@ class MPPIPlanner(nn.Module):
         self.action_low = float(action_low)
         self.action_high = float(action_high)
         self.device = device
+
+        # Dedicated RNG so the MPPI sample cloud is reproducible AND
+        # independent of how many draws earlier runs made (an eval matrix
+        # sharing the global RNG couples run N's noise to whether run N-1
+        # fall-aborted early). ``seed=None`` keeps the ambient global RNG
+        # (legacy behavior). A frozen-vs-adapt A/B passes the same seed so
+        # both arms see identical noise streams.
+        self._generator: torch.Generator | None = None
+        if seed is not None:
+            self._generator = torch.Generator(device=device)
+            self._generator.manual_seed(int(seed))
 
         if subgoal_emb.shape[-1] != backbone.output_dim:
             raise ValueError(
@@ -85,15 +99,8 @@ class MPPIPlanner(nn.Module):
         # Warm-started nominal trajectory for receding-horizon reuse.
         self.U: torch.Tensor | None = None
 
-        # Populated after every ``plan()`` call.
+        # Best terminal cost seen in the last ``plan()`` (logged by callers).
         self.best_cost: float = float("nan")
-        self.best_U: torch.Tensor | None = None
-        self.best_c_goal: float = float("nan")
-        self.c_goal_min: float = float("nan")
-        self.c_goal_max: float = float("nan")
-
-    def set_subgoal(self, subgoal_emb: torch.Tensor) -> None:
-        self.subgoal_emb = subgoal_emb.detach().to(self.device)
 
     def reset(self) -> None:
         self.U = None
@@ -206,12 +213,13 @@ class MPPIPlanner(nn.Module):
             U = torch.roll(self.U, shifts=-1, dims=0)
             U[-1] = 0.0
 
-        best_U = U.clone()
         best_cost = torch.tensor(float("inf"), device=device)
-        last_c_goal: torch.Tensor | None = None
 
         for _ in range(self.iterations):
-            noise = torch.randn(K, H, A, device=device) * self.noise_sigma
+            noise = (
+                torch.randn(K, H, A, device=device, generator=self._generator)
+                * self.noise_sigma
+            )
             candidates = (U.unsqueeze(0) + noise).clamp(
                 self.action_low, self.action_high
             )
@@ -227,8 +235,11 @@ class MPPIPlanner(nn.Module):
             out = self.jepa.rollout(info, action_seq, history_size=HS)
             pred_emb = out["predicted_emb"]  # (1, K, T_total, *latent)
             pred_final = pred_emb[0, :, -1]   # (K, *latent)
-            costs = self.cost_fn(pred_final, self.subgoal_emb)  # (K,)
-            last_c_goal = costs
+            # Score in fp32: under bf16 autocast the ~O(10^2-10^3) summed
+            # squared error would come back with ~2^-8 relative resolution,
+            # which at small sigma can quantize distinct candidates to tied
+            # costs and blunt the softmax ranking.
+            costs = self.cost_fn(pred_final.float(), self.subgoal_emb)  # (K,)
 
             beta = costs.min()
             weights = torch.exp(-(costs - beta) / self.lambda_)
@@ -237,17 +248,10 @@ class MPPIPlanner(nn.Module):
             delta = (weights.view(K, 1, 1) * noise).sum(dim=0)  # (H, A)
             U = (U + delta).clamp(self.action_low, self.action_high)
 
-            if beta < best_cost:
-                best_cost = beta
-                best_U = candidates[costs.argmin()].clone()
+            best_cost = torch.minimum(best_cost, beta)
 
         self.U = U
         self.best_cost = float(best_cost)
-        self.best_U = best_U
-        if last_c_goal is not None:
-            self.best_c_goal = float(last_c_goal.min())
-            self.c_goal_min = float(last_c_goal.min())
-            self.c_goal_max = float(last_c_goal.max())
         return U
 
 

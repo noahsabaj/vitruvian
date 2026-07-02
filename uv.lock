@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -310,37 +310,37 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cublas" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -3051,12 +3051,14 @@ dependencies = [
     { name = "h5py" },
     { name = "imageio" },
     { name = "jax", extra = ["cuda12"] },
+    { name = "mediapy" },
     { name = "mujoco" },
     { name = "mujoco-mjx" },
     { name = "mujoco-warp" },
+    { name = "numpy" },
     { name = "playground" },
     { name = "pyyaml" },
-    { name = "rich" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "transformers" },
@@ -3078,14 +3080,16 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "imageio", specifier = ">=2.37.3" },
     { name = "jax", extras = ["cuda12"], specifier = ">=0.10.0" },
+    { name = "mediapy", specifier = ">=1.2" },
     { name = "mujoco", specifier = ">=3.7.0" },
     { name = "mujoco-mjx", specifier = ">=3.7.0" },
     { name = "mujoco-warp", specifier = ">=3.7.0.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "numpy", specifier = ">=2.0" },
     { name = "playground", specifier = ">=0.2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "rich", specifier = ">=13.7" },
+    { name = "scipy", specifier = ">=1.11" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "torchvision", specifier = ">=0.26.0" },
     { name = "transformers", specifier = ">=5.5.4" },

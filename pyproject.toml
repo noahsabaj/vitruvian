@@ -14,12 +14,17 @@ dependencies = [
     "h5py>=3.16.0",
     "imageio>=2.37.3",
     "jax[cuda12]>=0.10.0",
+    "mediapy>=1.2",
     "mujoco>=3.7.0",
+    # mujoco-mjx / mujoco-warp / warp-lang are not imported first-party; they
+    # are pinned runtime deps of playground/mujoco (the Warp VRAM story in
+    # data/collection.py depends on these exact versions).
     "mujoco-mjx>=3.7.0",
     "mujoco-warp>=3.7.0.1",
+    "numpy>=2.0",
     "playground>=0.2.0",
     "pyyaml>=6.0",
-    "rich>=13.7",
+    "scipy>=1.11",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "transformers>=5.5.4",
@@ -46,9 +51,8 @@ vit-rollout = "vitruvian.cli.rollout:main"
 requires = ["uv_build>=0.8.0,<0.9"]
 build-backend = "uv_build"
 
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
+# Pyright is configured in pyrightconfig.json (which takes precedence over any
+# [tool.pyright] table here), so no [tool.pyright] section is kept.
 
 [tool.pytest.ini_options]
 # Scope pytest to our first-party tests only. Without this, bare

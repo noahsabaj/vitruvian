@@ -3,8 +3,10 @@
 # Same frozen prior + projector + proprio-conditioning + SIGReg as v5; only the
 # predictor + loss change (autoregressive -> dense parallel prefix). The anchor
 # is the single current frame (history_size=1); the predictor emits all 16
-# horizons in one pass, so training and planning never chain -> no compounding
-# rollout error (the M6 fix for the Q1a horizon-error growth).
+# horizons in one pass. Training never chains (num_preds=16 == max_horizon).
+# Planning emits up to max_horizon=16 per pass and re-anchors in blocks only
+# when the plan horizon exceeds it (e.g. horizon 50 -> 4 blocks) -> far less
+# compounding than step-by-step AR rollout (the M6 fix for Q1a horizon error).
 run_name: jepa_v6_fastlewm
 out_dir: ~/.vitruvian/jepa_v6_fastlewm
 
@@ -64,7 +66,11 @@ loss:
   num_preds: 16            # dense supervision over 16 parallel horizons
   rollout_weight: 1.0      # weight on horizons >=2 (vs the 1-step term)
   reg_weight: 1.0          # SIGReg isotropic-Gaussian anti-collapse (LeJEPA)
-  proprio_dropout: 0.25    # anchor proprio IS observed at plan time; light reg
+  # Proprio is train-time predictor conditioning only; the plan-time rollout is
+  # proprio-free (matches v5). Dropout zeroes the proprio encoder OUTPUT so a
+  # dropped anchor == the absent-proprio plan regime; 0.5 keeps that regime
+  # well-represented in training (see training.losses.prefix_prediction_loss).
+  proprio_dropout: 0.5
 
 data:
   h5: ~/.stable_worldmodel/g1_diverse_v1.h5

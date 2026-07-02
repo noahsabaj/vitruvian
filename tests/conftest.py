@@ -3,9 +3,9 @@
 """Shared fixtures — tiny synthetic HDF5 + mocked backbones.
 
 Keeps the whole suite CPU-only and under 60s by avoiding any HuggingFace
-weight download. The synthetic HDF5 mirrors the schema of the G1 expert
-dataset (pixels, proprio, action, ep_offset, ep_len) so dataset classes
-see realistic layouts.
+weight download. The synthetic HDF5 mirrors the full schema of the G1
+expert dataset (pixels, proprio, action, state, ep_offset, ep_len,
+commands) so dataset/merge code sees realistic layouts.
 """
 
 from __future__ import annotations
@@ -48,10 +48,20 @@ def synthetic_h5(tmp_path_factory) -> Path:
             data=rng.standard_normal((total, 29), dtype=np.float32),
         )
         f.create_dataset(
+            "state",
+            data=rng.standard_normal((total, 60), dtype=np.float32),
+        )
+        f.create_dataset(
             "ep_offset", data=np.asarray([0, ep_len], dtype=np.int64)
         )
         f.create_dataset(
             "ep_len", data=np.asarray([ep_len, ep_len], dtype=np.int64)
+        )
+        f.create_dataset(
+            "commands",
+            data=np.tile(
+                np.asarray([0.5, 0.0, 0.0], dtype=np.float32), (n_ep, 1)
+            ),
         )
     return path
 

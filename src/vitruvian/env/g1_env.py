@@ -41,13 +41,19 @@ def install_jax_brax_shim() -> None:
 
     brax 0.14 still calls ``jax.device_put_replicated`` which JAX 0.10
     removed. Replicate ourselves via ``tree.map``. Safe to call more
-    than once — the shim is idempotent.
+    than once — the shim is idempotent — and a no-op on any JAX version
+    that still ships ``device_put_replicated`` (we never shadow the real
+    implementation).
     """
     import jax
     import jax.numpy as jnp
 
     marker = "_vitruvian_replicate_shim"
     if getattr(jax, marker, False):
+        return
+    if hasattr(jax, "device_put_replicated"):
+        # This JAX still provides it — use the real one, don't shadow it.
+        setattr(jax, marker, True)
         return
 
     def _replicate(value, devices):
@@ -135,7 +141,23 @@ def build_env_and_policy(
     env = registry.load(env_name, config_overrides=env_overrides)
 
     policy = None
-    if ckpt_policy is not None and ckpt_policy.exists():
+    if ckpt_policy is None:
+        print(
+            "[env] no policy_ckpt given — MPPI will plan without a PPO warm "
+            "start (from zeros / receding-horizon)."
+        )
+    elif not ckpt_policy.exists():
+        # A wrong path silently changes the experiment (no warm start). Paths
+        # are resolved relative to the CWD, so a run launched from elsewhere is
+        # the usual cause — surface it loudly rather than degrade silently.
+        import warnings
+
+        warnings.warn(
+            f"policy_ckpt {ckpt_policy} does not exist — MPPI will plan WITHOUT "
+            "a PPO warm start. Check the path (resolved relative to the CWD).",
+            stacklevel=2,
+        )
+    else:
         if ckpt_policy.is_dir():
             params = brax_checkpoint.load(str(ckpt_policy.resolve()))
         else:

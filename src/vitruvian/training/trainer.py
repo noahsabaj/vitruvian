@@ -170,9 +170,11 @@ class JEPATrainer:
         """Run the train loop. Returns best-val metrics."""
         torch.manual_seed(self.cfg.seed)
 
+        # The frozen DINOv3 backbone is pinned to eval() by the backbone's
+        # own train()/eval() override (see DINOv3*Backbone.train), which
+        # nn.Module propagation triggers on every jepa.train()/eval() below —
+        # no manual dinov3.eval() calls needed here.
         jepa = self.jepa.to(device)
-        if hasattr(jepa, "backbone") and getattr(jepa.backbone, "dinov3", None) is not None:
-            jepa.backbone.dinov3.eval()
 
         opt = self._build_optimizer()
         steps_per_epoch = len(train_loader)
@@ -182,13 +184,12 @@ class JEPATrainer:
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         best_val = float("inf")
+        best_score_key = "val_pred_loss+rollout"
         step = 0
         t0 = time.perf_counter()
 
         for epoch in range(1, self.cfg.epochs + 1):
-            jepa.train()
-            if hasattr(jepa, "backbone") and getattr(jepa.backbone, "dinov3", None) is not None:
-                jepa.backbone.dinov3.eval()
+            jepa.train()  # backbone.train() override keeps frozen DINOv3 in eval
 
             tr_sums: dict[str, float] = {}
             tr_n = 0
@@ -251,7 +252,16 @@ class JEPATrainer:
             )
 
             suffixes: list[str] = ["latest", "epoch_{epoch:03d}"]
-            val_primary = va_metrics.get("val_pred_loss", float("inf"))
+            # Select "best" on the full prediction objective (1-step +
+            # multi-horizon rollout), not just the 1-step ``val_pred_loss``.
+            # For Fast-LeWM the 1-step term is a single horizon of 16; scoring
+            # on it alone would ignore the long horizons that are the whole
+            # point of the dense prefix loss. ``val_rollout_loss`` is 0 when the
+            # rollout term is off, so this reduces to ``val_pred_loss`` for AR
+            # runs with ``rollout_weight=0``.
+            val_primary = va_metrics.get(
+                "val_pred_loss", float("inf")
+            ) + va_metrics.get("val_rollout_loss", 0.0)
             if val_primary < best_val:
                 best_val = val_primary
                 suffixes.append("best")
@@ -259,9 +269,9 @@ class JEPATrainer:
 
         print(
             f"=== training done in {time.perf_counter() - t0:.1f}s; "
-            f"best val_pred_loss: {best_val:.4f} ==="
+            f"best {best_score_key}: {best_val:.4f} ==="
         )
-        return {"best_val_pred_loss": best_val}
+        return {best_score_key: best_val}
 
 
 class _noop_cm:

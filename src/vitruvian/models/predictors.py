@@ -343,7 +343,11 @@ class PrefixPatchPredictor(nn.Module):
         self.prefix_mlp = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Linear(hidden, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, hidden)
+                    nn.Linear(hidden, mlp_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(mlp_dim, hidden),
+                    nn.Dropout(dropout),
                 )
                 for _ in range(prefix_depth)
             ]
@@ -378,7 +382,9 @@ class PrefixPatchPredictor(nn.Module):
         ):
             toks = toks + attn(ln(toks), causal=True)
             toks = toks + mlp(mln(toks))
-        return self.prefix_norm(toks[:, 1:])  # drop the 0-th (state) output
+        # drop the 0-th (state) output; keep only the per-action prefix tokens
+        prefixes: torch.Tensor = self.prefix_norm(toks[:, 1:])
+        return prefixes
 
     def forward(
         self,

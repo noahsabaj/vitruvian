@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from vitruvian.data import CollectionConfig, CommandSpec, run_collection
+from vitruvian.data.collection import merge_hdf5_chunks_streaming
 
 
 def _fake_chunk_writer(out: Path) -> None:
@@ -102,3 +103,55 @@ def test_run_collection_all_fail_raises_regardless(tmp_path: Path) -> None:
     with patch("vitruvian.data.collection._spawn_worker", side_effect=fake_spawn):
         with pytest.raises(RuntimeError, match="All chunks failed"):
             run_collection(cfg, single_process=False, allow_partial=True)
+
+
+def _identifiable_chunk(path: Path, base: int, cmd: list[float], n: int = 3) -> None:
+    """A chunk whose every row equals ``base`` — so a scrambled merge is visible."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("pixels", data=np.full((n, 4, 4, 3), base % 256, dtype=np.uint8))
+        f.create_dataset("action", data=np.full((n, 29), base, dtype=np.float32))
+        f.create_dataset("proprio", data=np.full((n, 103), base, dtype=np.float32))
+        f.create_dataset("state", data=np.full((n, 40), base, dtype=np.float32))
+        f.create_dataset("ep_len", data=np.array([n], dtype=np.int32))
+        f.create_dataset("ep_offset", data=np.array([0], dtype=np.int64))
+        f.create_dataset("commands", data=np.asarray([cmd], dtype=np.float32))
+
+
+def test_merge_preserves_row_alignment(tmp_path: Path) -> None:
+    """The streaming merge must keep pixels/action/proprio/state rows aligned
+    with ep_offset/ep_len/commands across chunks — a scrambled merge silently
+    corrupts the dataset. Also checks the distinct-command mode labelling."""
+    c0 = tmp_path / "chunk_0000.h5"
+    c1 = tmp_path / "chunk_0001.h5"
+    _identifiable_chunk(c0, 10, [0.5, 0.0, 0.0])
+    _identifiable_chunk(c1, 20, [-0.5, 0.0, 0.0])
+    out = tmp_path / "merged.h5"
+    merge_hdf5_chunks_streaming([c0, c1], out)
+
+    with h5py.File(out, "r") as f:
+        assert f["action"].shape[0] == 6
+        assert (f["action"][:3] == 10).all() and (f["action"][3:] == 20).all()
+        assert (f["proprio"][:3] == 10).all() and (f["proprio"][3:] == 20).all()
+        assert (f["state"][:3] == 10).all() and (f["state"][3:] == 20).all()
+        assert list(f["ep_offset"][:]) == [0, 3]
+        assert list(f["ep_len"][:]) == [3, 3]
+        # commands stay aligned to their episodes
+        assert f["commands"][0, 0] == 0.5 and f["commands"][1, 0] == -0.5
+        assert int(f.attrs["n_distinct_commands"]) == 2
+        assert f.attrs["collection_mode"] == "diverse-command-grid"
+
+
+def test_merge_single_command_labelled_narrow(tmp_path: Path) -> None:
+    """Many chunks/episodes of ONE command is 'narrow', not 'diverse' — the
+    label must key on distinct commands, not chunk count."""
+    files = []
+    for i in range(3):
+        p = tmp_path / f"chunk_{i:04d}.h5"
+        _identifiable_chunk(p, i + 1, [0.5, 0.0, 0.0])  # same command each chunk
+        files.append(p)
+    out = tmp_path / "merged.h5"
+    merge_hdf5_chunks_streaming(files, out)
+    with h5py.File(out, "r") as f:
+        assert int(f.attrs["n_distinct_commands"]) == 1
+        assert f.attrs["collection_mode"] == "narrow"

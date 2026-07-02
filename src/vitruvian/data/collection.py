@@ -258,12 +258,26 @@ def run_collection(
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(_run_one, s) for s in specs]
-            for fut in concurrent.futures.as_completed(futs):
-                _handle(*fut.result())
+            try:
+                for fut in concurrent.futures.as_completed(futs):
+                    _handle(*fut.result())
+            except KeyboardInterrupt:
+                # Cancel not-yet-started chunks so an interrupt actually stops
+                # the run. In-flight subprocesses can't be cancelled (they run
+                # to completion), but queued work won't launch, and re-raising
+                # skips the merge so no half-baked HDF5 is written.
+                for pending in futs:
+                    pending.cancel()
+                raise
     total_wall = time.perf_counter() - t_start
 
     if not chunk_files:
         raise RuntimeError("All chunks failed; nothing to merge.")
+
+    # Merge in a deterministic (gid) order regardless of completion order, so a
+    # given (config, seed) always yields the same episode layout — and thus the
+    # same downstream train/val split. Chunk filenames are gid-prefixed.
+    chunk_files.sort()
 
     print(
         f"[merge] {len(chunk_files)} chunk(s) ({failed} failed) "
@@ -380,7 +394,15 @@ def merge_hdf5_chunks_streaming(
                     "proprio_dim": int(f["proprio"].shape[1]),
                     "state_dim": int(f["state"].shape[1]),
                 }
-                first_attrs = dict(f.attrs)
+                # Keep only run-invariant attrs. The per-chunk command/seed
+                # attrs (``vel_x/vel_y/yaw_rate/seed``) describe a single chunk
+                # and would be a misleading race-winner value on a merged
+                # multi-command file — the per-episode ``commands`` dataset is
+                # the source of truth for command, so drop them here.
+                _per_chunk = {"seed", "vel_x", "vel_y", "yaw_rate"}
+                first_attrs = {
+                    k: v for k, v in dict(f.attrs).items() if k not in _per_chunk
+                }
 
     ep_len_all = np.concatenate(ep_len_list, axis=0).astype(np.int32)
     ep_offset_all = np.concatenate(
@@ -419,10 +441,12 @@ def merge_hdf5_chunks_streaming(
             fout.attrs[k] = v
         fout.attrs["total_steps"] = total_rows
         fout.attrs["n_episodes"] = int(ep_len_all.shape[0])
+        # Label by the number of DISTINCT commands, not the chunk/episode count
+        # (a narrow single-command dataset is still many chunks + episodes).
+        n_distinct_cmds = int(np.unique(commands_all, axis=0).shape[0])
+        fout.attrs["n_distinct_commands"] = n_distinct_cmds
         fout.attrs["collection_mode"] = (
-            "diverse-command-grid"
-            if len(commands_list) > 1 or commands_all.shape[0] > 1
-            else "narrow"
+            "diverse-command-grid" if n_distinct_cmds > 1 else "narrow"
         )
 
         cursor = 0
@@ -561,6 +585,19 @@ def collect_chunk(
     for _ep in range(n_episodes):
         rng, reset_key = jax.random.split(rng)
         state = _pin(reset_fn(reset_key))
+        # ``reset_fn`` samples a RANDOM command and bakes it into ``state.obs``
+        # (dims 9:12 of the "state" obs) before returning; ``_pin`` overwrites
+        # ``info["command"]`` but NOT the already-computed obs. Advance one
+        # pinned step so ``step_fn`` recomputes obs from the pinned command
+        # before we record anything — otherwise frame 0's proprio, and the
+        # policy action derived from it, would track the random reset command,
+        # contradicting this episode's ``commands`` entry. The settling action
+        # is discarded (not recorded); every recorded frame is now
+        # command-consistent. (From t>=1 obs was already consistent because it
+        # is recomputed inside ``step_fn`` from the pinned info.)
+        rng, settle_key = jax.random.split(rng)
+        settle_action, _ = inference_fn(state.obs, settle_key)
+        state = _pin(step_fn(state, settle_action))
 
         ep_pixels = np.zeros(
             (episode_steps, img_size, img_size, 3), dtype=np.uint8
@@ -653,6 +690,11 @@ def collect_chunk(
         f.attrs["vel_x"] = command.vel_x
         f.attrs["vel_y"] = command.vel_y
         f.attrs["yaw_rate"] = command.yaw_rate
+
+    # Release the renderer's GL/EGL context. In subprocess mode the process
+    # exit would reclaim it, but ``single_process=True`` calls collect_chunk
+    # repeatedly in one process and would otherwise leak a context per chunk.
+    renderer.close()
 
 
 # --------------------------------------------------------------------------

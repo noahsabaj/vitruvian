@@ -38,7 +38,7 @@ change.
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 
@@ -94,45 +94,20 @@ def bf16_autocast(enabled: bool = True) -> Iterator[None]:
         loss.backward()
         opt.step()
 
-    Pass ``enabled=False`` for a no-op (useful for ablation / debug).
+    Picks the CUDA autocast device when a GPU is present and CPU
+    otherwise, so CPU-only precompute/tests don't trip the
+    ``device_type="cuda"`` "no CUDA" warning-and-fallback. Pass
+    ``enabled=False`` for a no-op (useful for ablation / debug).
     """
     if not enabled:
         yield
         return
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
         yield
-
-
-def compile_and_warm(
-    model: "nn.Module", *example_inputs: Any
-) -> "nn.Module":
-    """Compile a model and (optionally) run one warmup call so the
-    first production invocation doesn't eat the torch.compile stall.
-
-    **What this does:**
-      1. Wraps ``model`` in :func:`compile_model` with
-         ``mode="reduce-overhead", dynamic=True``.
-      2. If ``example_inputs`` is supplied, runs one call under
-         ``torch.no_grad() + bf16_autocast()`` to trigger the
-         compile.
-
-    **What this does NOT do:** the returned module is the bare
-    compiled module. Subsequent calls are unwrapped — the caller is
-    responsible for ``torch.no_grad()`` and/or ``bf16_autocast()`` at
-    every call site where those are appropriate.
-
-    (The function was previously named ``compiled_no_grad_forward``,
-    which wrongly implied those contexts were enforced on every call.)
-    """
-    compiled = compile_model(model, mode="reduce-overhead", dynamic=True)
-    if example_inputs:
-        with torch.no_grad(), bf16_autocast():
-            compiled(*example_inputs)
-    return compiled
 
 
 __all__ = [
     "bf16_autocast",
     "compile_model",
-    "compile_and_warm",
 ]

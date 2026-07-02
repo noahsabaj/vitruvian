@@ -2,7 +2,7 @@
 
 *Living document. Updated each session.*
 
-**Last updated:** 2026-06-30
+**Last updated:** 2026-07-02
 
 ---
 
@@ -54,10 +54,19 @@ git history prior to 2026-06-30.
 Milestones are questions now, not features (see ADR 009).
 
 ### Now
-- **Q1 — Does the planner earn its keep?**
+- **Q1 — Does the planner earn its keep?** *(answered — see the 2026-07-01
+  journal: WM beats persistence, planner steers + generalizes to OOD-command
+  goals; latent is action-sensitive.)*
   - (a) Open-loop **latent rollout accuracy** on held-out trajectories — the world model's true quality metric.
   - (b) MPPI success on **OOD goal-images** the PPO walker never optimized (sideways, backward, novel pose). If it only reproduces the expert, the world model is decorative.
   - *No new training — runs on the M5 baseline.*
+- **M6 — Fast-LeWM (arXiv:2606.26217).** Parallel action-prefix predictor
+  replacing autoregressive rollout (fixes Q1a horizon-error growth, ~4× planning
+  speed). **Code-complete + committed + review-hardened** (2026-07-02 fixed a
+  prefix-rollout off-by-one, a prefix-aware test-time adapter, seeded MPPI, and
+  the proprio train/plan conditioning consistency). **Pending train** on
+  `configs/train/jepa_v6_fastlewm.yaml`, then a decisive Q1a horizon-curve
+  comparison vs the v5 baseline.
 
 ### Soon
 - **Q2 — Reward-free world model.** Zero `tracking_lin_vel`; keep an upright/homeostatic term; diversify (randomized commands + action noise) → data spanning *dynamics*, not the reward-optimal slice. Retrain JEPA; compare rollout accuracy + OOD planning to the baseline.

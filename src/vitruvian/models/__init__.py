@@ -11,7 +11,11 @@ from vitruvian.models.backbones import (
     load_lewm_jepa_from_checkpoint,
 )
 from vitruvian.models.jepa import JEPA, PlannerBackbone
-from vitruvian.models.predictors import ARPredictor, PatchARPredictor
+from vitruvian.models.predictors import (
+    ARPredictor,
+    PatchARPredictor,
+    PrefixPatchPredictor,
+)
 from vitruvian.models.registry import BACKBONES, PREDICTORS, build_jepa, load_jepa
 
 __all__ = [
@@ -26,6 +30,7 @@ __all__ = [
     "PREDICTORS",
     "PatchARPredictor",
     "PlannerBackbone",
+    "PrefixPatchPredictor",
     "build_jepa",
     "load_jepa",
     "load_lewm_jepa_from_checkpoint",

@@ -22,11 +22,10 @@ history frame even though only the *newest* frame is new.
 
 With 10 macros + 3-frame history, that's 30 encoder forwards per
 walking run — 20 of them redundant. Under v5 DINOv3 ViT-B at ~10 ms
-per forward in inference, that's ~200 ms of pure waste per run ×
-40 eval runs = ~8 s saved from the eval matrix alone. More importantly
-the ad-hoc list management is error-prone: M4.5 had a bug where the
-action history was offset by one wrt. the pixel history (fixed during
-M4.6 debug).
+per forward in inference, that's ~200 ms of pure waste per run, saved
+across the whole eval matrix. More importantly the ad-hoc list
+management is error-prone: M4.5 had a bug where the action history was
+offset by one wrt. the pixel history (fixed during M4.6 debug).
 
 This module factors the pattern into a small ring-buffer class with
 an explicit encoder-per-push invariant.
@@ -81,7 +80,6 @@ class EncoderHistory:
         self.size = int(size)
         self._encoder = encoder
         self._buf: deque[torch.Tensor] = deque(maxlen=self.size)
-        self._raw_buf: deque[torch.Tensor] = deque(maxlen=self.size)
 
     # ------------------------------------------------------------------
     # Core operations
@@ -102,18 +100,16 @@ class EncoderHistory:
                 f"expected (3, H, W), got {tuple(pixels_chw.shape)}"
             )
         # Encoder expects (B, T, 3, H, W); we pass (1, 1, ...) and
-        # squeeze twice. This matches LeWMBackboneAdapter and
-        # DINOv3PatchBackbone signatures.
+        # squeeze twice. This matches the DINOv3 backbones' / PlannerBackbone
+        # encode() signature.
         batched = pixels_chw.unsqueeze(0).unsqueeze(0)
         emb = self._encoder(batched).squeeze(0).squeeze(0)
         self._buf.append(emb)
-        self._raw_buf.append(pixels_chw)
         return emb
 
     def reset(self) -> None:
         """Drop all history."""
         self._buf.clear()
-        self._raw_buf.clear()
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -138,17 +134,6 @@ class EncoderHistory:
         if not self._buf:
             raise RuntimeError("EncoderHistory is empty — push() before latest_window()")
         frames = list(self._buf)
-        if len(frames) < self.size:
-            pad_n = self.size - len(frames)
-            frames = [frames[0]] * pad_n + frames
-        return torch.stack(frames, dim=0)
-
-    def raw_window(self) -> torch.Tensor:
-        """Same window but for raw pixels (uint8/float CHW). Useful for
-        debugging or video rendering; not for model input."""
-        if not self._raw_buf:
-            raise RuntimeError("EncoderHistory is empty — push() before raw_window()")
-        frames = list(self._raw_buf)
         if len(frames) < self.size:
             pad_n = self.size - len(frames)
             frames = [frames[0]] * pad_n + frames

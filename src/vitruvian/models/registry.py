@@ -347,13 +347,11 @@ def load_jepa(
         cfg = _migrate_v4_config(cfg)
     elif legacy == "v5":
         cfg = _migrate_v5_config(cfg)
-    else:
-        # Unified schema — ensure device override.
-        bb_kwargs = cfg.setdefault("backbone", {}).setdefault("kwargs", {})
-        bb_kwargs["device"] = device
 
-    # Backbone-level device override for legacy migration too.
-    cfg["backbone"]["kwargs"]["device"] = device
+    # Force the target device on the backbone for every schema. Migrated
+    # configs already carry ``backbone.kwargs``; a hand-written unified config
+    # might not, so ``setdefault`` the structure before writing.
+    cfg.setdefault("backbone", {}).setdefault("kwargs", {})["device"] = device
 
     model = build_jepa(cfg)
     state = _normalize_state_dict(ckpt["state_dict"])

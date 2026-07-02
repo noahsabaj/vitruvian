@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 The Vitruvian Authors
 # Portions copyright the LeWM authors — vendored from
-# https://github.com/... (see NOTICE). Kept close to upstream so v3
-# checkpoints load unchanged.
+# https://github.com/lucas-maes/le-wm (see NOTICE). Kept close to
+# upstream so v3 checkpoints load unchanged.
 """Vendored LeWM JEPA composer.
 
 Retained for **loading legacy v3 checkpoints** only. New code should

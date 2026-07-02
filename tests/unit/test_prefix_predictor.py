@@ -104,3 +104,29 @@ def test_prefix_prediction_loss_and_backward(registry_with_fakes) -> None:
     out["loss"].backward()
     grads = [p.grad for p in m.predictor.parameters() if p.grad is not None]
     assert grads, "predictor must receive gradients from the prefix loss"
+
+
+def test_prefix_proprio_dropout_equals_absent(registry_with_fakes) -> None:
+    """proprio_dropout zeroes the encoder OUTPUT, so a fully-dropped anchor
+    (dropout=1.0) yields exactly the same prediction as a batch with no proprio
+    at all — i.e. 'dropped' == 'absent' == the plan-time ``state_cond=None``
+    regime. (Masking the encoder INPUT would instead leave ``pe(0) != 0`` in the
+    state token, a train/plan mismatch.)"""
+    from vitruvian.training import prefix_prediction_loss
+
+    m = build_jepa(_v6_cfg(max_horizon=8)).train()  # dropout=0.0 -> deterministic
+    B, T, N = 2, 9, 49
+    base = {
+        "patches": torch.randn(B, T, N, 768),
+        "action": torch.randn(B, T, 29),
+    }
+    with_prop = {**base, "proprio": torch.randn(B, T, 103)}
+    dropped = prefix_prediction_loss(
+        m, with_prop, history_size=1, num_preds=8,
+        reg_weight=0.0, proprio_dropout=1.0,  # drop every anchor
+    )
+    absent = prefix_prediction_loss(
+        m, base, history_size=1, num_preds=8, reg_weight=0.0, proprio_dropout=0.0,
+    )
+    assert torch.allclose(dropped["pred_loss"], absent["pred_loss"], atol=1e-6)
+    assert torch.allclose(dropped["rollout_loss"], absent["rollout_loss"], atol=1e-6)

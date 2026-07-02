@@ -16,9 +16,11 @@ that keep the **frozen-prior thesis** intact:
   trained, so it cannot collapse. Their ablation supports predictor-only
   adaptation: "most of the needed correction lies in the predictor" for
   shape/dynamics shift (dynamics shift being our likely humanoid regime).
-* The adaptation loss is our own :func:`~vitruvian.training.losses.prediction_loss`
-  in the projected latent — the exact training objective, on the transitions
-  the agent just executed. We reuse the ``"emb"`` path (pre-projected
+* The adaptation loss is our own training objective in the projected latent, on
+  the transitions the agent just executed — :func:`~vitruvian.training.losses.prediction_loss`
+  for an autoregressive predictor, or :func:`~vitruvian.training.losses.prefix_prediction_loss`
+  for a Fast-LeWM prefix predictor (selected automatically via
+  ``jepa.is_prefix_predictor``). We reuse the ``"emb"`` path (pre-projected
   embeddings), so the frozen projector/encoder are not even in the graph.
 
 Usage (per episode, in an MPC/plan loop)::
@@ -27,9 +29,10 @@ Usage (per episode, in an MPC/plan loop)::
     adapter.reset()                     # each episode starts from the pretrained predictor
     for macro in range(...):
         U = planner.plan(...)           # uses the current (possibly adapted) predictor
-        # execute U; for each executed frame collect its projected embedding z_t
-        # (from the planner backbone / EncoderHistory) and the action a_t:
-        for z_t, a_t in executed_transitions:
+        # execute U; collect the tail transitions of the macro as aligned
+        # (projected embedding z_t, action a_t) pairs — enough to fill one
+        # ``history_size + num_preds`` window — and push them:
+        for z_t, a_t in tail_transitions:
             adapter.push(z_t, a_t)
         adapter.step(n_steps=1)         # 1 GD step on the recent buffer; predictor updated in place
 
@@ -44,7 +47,7 @@ from typing import Any
 
 import torch
 
-from vitruvian.training.losses import prediction_loss
+from vitruvian.training.losses import prediction_loss, prefix_prediction_loss
 
 
 class TestTimeAdapter:
@@ -78,7 +81,11 @@ class TestTimeAdapter:
         if getattr(jepa, "predictor", None) is None:
             raise ValueError("TestTimeAdapter requires a jepa with a predictor")
         self.jepa = jepa
-        self.history_size = int(history_size)
+        # Fast-LeWM always anchors on a single observed frame, so a prefix
+        # predictor adapts with history_size=1 regardless of what the planner
+        # uses for its rollout window.
+        self.is_prefix = bool(getattr(jepa, "is_prefix_predictor", False))
+        self.history_size = 1 if self.is_prefix else int(history_size)
         self.num_preds = max(1, int(num_preds))
         self.lr = float(lr)
         self.seq_len = self.history_size + self.num_preds
@@ -125,13 +132,17 @@ class TestTimeAdapter:
         act = torch.stack(list(self._act)[-self.seq_len :], dim=0).unsqueeze(0).to(dev)
         batch = {"emb": emb, "action": act}
         rollout_weight = 1.0 if self.num_preds >= 2 else 0.0
+        # Prefix predictors need the dense-prefix objective; the AR-only
+        # prediction_loss would call model.predict() and hit the prefix
+        # predictor's 3-D anchor assertion.
+        loss_fn = prefix_prediction_loss if self.is_prefix else prediction_loss
 
         was_training = bool(getattr(self.jepa, "training", False))
         self.jepa.eval()  # deterministic adapt: no predictor dropout
         last: float | None = None
         for _ in range(int(n_steps)):
             self.opt.zero_grad(set_to_none=True)
-            out = prediction_loss(
+            out = loss_fn(
                 self.jepa,
                 batch,
                 history_size=self.history_size,

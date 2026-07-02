@@ -47,3 +47,12 @@ def test_bad_override_raises(tmp_path: Path) -> None:
     p.write_text("{}\n")
     with pytest.raises(ValueError):
         load_config(p, overrides=["not-a-kv-pair"])
+
+
+def test_override_into_scalar_raises(tmp_path: Path) -> None:
+    """Descending through a scalar node is almost always a typo — raise a clear
+    error instead of silently clobbering the scalar with a new mapping."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text("trainer: 5\n")
+    with pytest.raises(ValueError, match="not a mapping"):
+        load_config(p, overrides=["trainer.lr=1e-4"])

@@ -2,13 +2,15 @@
 # Copyright 2026 The Vitruvian Authors
 """``vit-eval`` — eval-matrix driver.
 
-Single-process runner — replaces the 40-row bash loop that re-paid ~8s
-Python + JAX + model-load startup per config. See
+Single-process runner — replaces the per-config bash loop that re-paid
+~8s Python + JAX + model-load startup per run. See
 :func:`vitruvian.cli.eval.main` for the run loop.
 
-Configs are expected to carry a ``runs`` list of ``RunConfig`` dicts;
-each run fires a full walk with fresh env reset but shared
-env/JEPA/policy state.
+Configs carry a ``runs`` list of ``RunConfig`` dicts (per-run goal /
+sigma / seed / horizon) and an optional top-level ``planner`` block for
+the knobs shared across the matrix (``action_dim``, ``iterations``,
+``history_size``, ``lambda``). Each run fires a full walk with a fresh
+env reset but shared env/JEPA/policy state.
 """
 
 from __future__ import annotations
@@ -73,9 +75,11 @@ def _run_one(
     planner_backbone,
     adapter: TestTimeAdapter | None = None,
     adapt_steps: int = 1,
+    plan_cfg: dict | None = None,
 ) -> RunResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pinned_cmd = env_ctx.get("pinned_cmd")
+    plan_cfg = plan_cfg or {}
 
     # Fresh env reset for this run. Pin the eval command into the state so
     # the rollout actually runs under ``vel_cmd`` (the env otherwise keeps
@@ -102,13 +106,17 @@ def _run_one(
         backbone=planner_backbone,
         subgoal_emb=goal_emb,
         cost_fn=MSECost(),
-        action_dim=29,
+        action_dim=int(plan_cfg.get("action_dim", 29)),
         horizon=cfg.horizon,
         num_samples=cfg.num_samples,
         noise_sigma=cfg.sigma,
-        iterations=3,
-        history_size=3,
+        lambda_=float(plan_cfg.get("lambda", 0.0025)),
+        iterations=int(plan_cfg.get("iterations", 3)),
+        history_size=int(plan_cfg.get("history_size", 3)),
         device=device,
+        # Reproducible, order-independent MPPI noise; the same seed across the
+        # frozen and --adapt arms so the A/B differs only in the predictor.
+        seed=cfg.seed,
     )
     HS = planner.history_size
     history = EncoderHistory(size=HS, encoder=planner_backbone.encode)
@@ -122,7 +130,8 @@ def _run_one(
     def _capture_frame() -> None:
         pix = render_head_cam(env_ctx)
         pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
-        history.push(pix_chw)
+        with torch.no_grad():  # history frames feed inference only — no graph
+            history.push(pix_chw)
 
     def _encode_current() -> torch.Tensor:
         # Encode the CURRENT (pre-step) head-cam obs WITHOUT touching the
@@ -253,8 +262,12 @@ def main() -> None:
         jepa.predictor = compile_model(jepa.predictor, mode="reduce-overhead")
 
     planner_backbone = PlannerBackbone(jepa)
+    plan_cfg = cfg.get("planner", {})
+    adapter_hs = int(plan_cfg.get("history_size", 3))
     adapter = (
-        TestTimeAdapter(jepa, history_size=3, num_preds=1, buffer_size=4)
+        TestTimeAdapter(
+            jepa, history_size=adapter_hs, num_preds=1, buffer_size=adapter_hs + 1
+        )
         if args.adapt
         else None
     )
@@ -264,6 +277,10 @@ def main() -> None:
         if cfg.get("policy_ckpt")
         else None
     )
+    # Resolve a relative policy_ckpt against the repo root so the shipped
+    # configs (e.g. ``checkpoints/m1-g1-full/...``) work from any CWD.
+    if policy_ckpt is not None and not policy_ckpt.is_absolute():
+        policy_ckpt = repo_root / policy_ckpt
     env_ctx = build_env_and_policy(
         ckpt_policy=policy_ckpt,
         device=device,
@@ -292,7 +309,8 @@ def main() -> None:
         for i, r_cfg in enumerate(runs_cfg, 1):
             print(f"[{i}/{len(runs_cfg)}] {r_cfg}")
             res = _run_one(
-                r_cfg, env_ctx, jepa, planner_backbone, adapter, args.adapt_steps
+                r_cfg, env_ctx, jepa, planner_backbone, adapter,
+                args.adapt_steps, plan_cfg,
             )
             jf.write(json.dumps(asdict(res)) + "\n")
             tf.write(

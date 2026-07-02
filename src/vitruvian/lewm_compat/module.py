@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 The Vitruvian Authors
 # Portions copyright the LeWM authors — vendored from
-# https://github.com/... (see NOTICE). Kept intentionally close to
-# upstream so checkpoints trained against LeWM load unchanged.
+# https://github.com/lucas-maes/le-wm (see NOTICE). Kept intentionally
+# close to upstream so checkpoints trained against LeWM load unchanged.
 """Vendored LeWM modules.
 
 Exposes the exact classes Vitruvian depends on:
@@ -16,10 +16,11 @@ Exposes the exact classes Vitruvian depends on:
 * ``ARPredictor`` — autoregressive predictor with learned positional
   embeddings and AdaLN-zero conditioning.
 
-Only the classes we actively import from Vitruvian are vendored. Unused
-training helpers (SIGReg is retained because it is cheap and lets us keep
-LeWM v3 checkpoints loadable), dataset code, and Lightning glue were
-intentionally dropped.
+Only the classes we actively import from Vitruvian are vendored; dataset
+code and Lightning glue were dropped. ``SIGReg`` is kept as the faithful
+upstream reference that :func:`vitruvian.training.losses.sigreg_loss`
+reimplements (our anti-collapse term is the reimplementation; this class
+is not itself instantiated by any live path).
 """
 
 from __future__ import annotations
@@ -92,6 +93,9 @@ class Attention(nn.Module):
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
         self.heads = heads
+        # ``scale`` and ``attend`` are vendored-faithful but unused: the
+        # forward path uses ``F.scaled_dot_product_attention``, which applies
+        # the 1/sqrt(d) scaling and softmax internally.
         self.scale = dim_head**-0.5
         self.dropout = dropout
         self.norm = nn.LayerNorm(dim)

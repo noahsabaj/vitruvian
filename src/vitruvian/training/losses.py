@@ -44,6 +44,13 @@ class _JEPALike(Protocol):
 
     def predict(self, emb: torch.Tensor, cond: torch.Tensor) -> torch.Tensor: ...
 
+    def predict_prefix(
+        self,
+        anchor: torch.Tensor,
+        act_emb: torch.Tensor,
+        state_cond: torch.Tensor | None = ...,
+    ) -> torch.Tensor: ...
+
 
 def vicreg_std_loss(emb: torch.Tensor, *, eps: float = 1e-4) -> torch.Tensor:
     """Penalize per-channel embedding std below 1 (VICReg variance term).
@@ -147,24 +154,29 @@ def _conditioning(
     """Per-frame predictor conditioning ``(B, T, hidden)``.
 
     ``cond = action_encoder(action) + proprio_encoder(proprio)``. During
-    training, whole frames of proprio are zeroed with probability
-    ``proprio_dropout`` so the predictor learns to operate with the
-    proprio conditioning absent — which is exactly the plan-time rollout
-    regime (future proprio is unobserved). ``proprio_encoder(0)`` is a
-    learned constant meaning "proprio unknown", consistent between the
-    dropped training frames and the missing rollout frames.
+    training, whole frames of proprio conditioning are dropped with
+    probability ``proprio_dropout`` by zeroing the proprio encoder's
+    *output*, so a dropped frame contributes exactly nothing to ``cond``.
+    That matches the plan-time rollout regime precisely: there, proprio is
+    unobserved and the rollout adds no proprio term at all (see
+    :meth:`vitruvian.models.jepa.JEPA.rollout`). Masking the encoder
+    *input* instead would leave the learned constant ``proprio_encoder(0)``
+    (which is ``!= 0`` — the MLP has biases) in the sum on dropped frames,
+    a conditioning offset the plan-time rollout never reproduces.
     """
     cond: torch.Tensor = model.action_encoder(batch["action"])
     pe = model.proprio_encoder
     if pe is not None and "proprio" in batch:
-        prop = batch["proprio"].float()
+        prop_emb = pe(batch["proprio"].float())  # (B, T, hidden)
         if proprio_dropout > 0.0 and getattr(model, "training", False):
             keep = (
-                torch.rand(prop.shape[0], prop.shape[1], 1, device=prop.device)
+                torch.rand(
+                    prop_emb.shape[0], prop_emb.shape[1], 1, device=prop_emb.device
+                )
                 >= proprio_dropout
-            ).to(prop.dtype)
-            prop = prop * keep
-        cond = cond + pe(prop)
+            ).to(prop_emb.dtype)
+            prop_emb = prop_emb * keep
+        cond = cond + prop_emb
     return cond
 
 
@@ -252,7 +264,7 @@ def prediction_loss(
             # window's own last input and would train a copy).
             tgt_k = emb[:, k + ctx_len : k + ctx_len + 1]
             rollout_losses.append((pred_emb[:, -1:] - tgt_k).pow(2).mean())
-        rollout_loss = sum(rollout_losses) / max(1, len(rollout_losses))
+        rollout_loss = torch.stack(rollout_losses).mean()
     else:
         rollout_loss = torch.zeros((), device=emb.device)
 
@@ -266,11 +278,7 @@ def prediction_loss(
     return {
         "loss": total,
         "pred_loss": pred_loss.detach(),
-        "rollout_loss": (
-            rollout_loss.detach()
-            if torch.is_tensor(rollout_loss)
-            else torch.zeros((), device=emb.device)
-        ),
+        "rollout_loss": rollout_loss.detach(),
         "reg_loss": reg_loss.detach(),
         "n_rollout_steps": len(rollout_losses),
     }
@@ -297,10 +305,12 @@ def prefix_prediction_loss(
     M6 fix for the Q1a horizon-error growth).
 
     Requires ``model.predict_prefix`` and a patch batch (``"patches"``). The
-    anchor's proprio is folded in as ``state_cond`` (per-sample dropout keeps
-    the model robust if it is ever absent). For logging parity with
-    :func:`prediction_loss`, the 1-step term is reported as ``pred_loss`` and
-    horizons ≥2 as ``rollout_loss``.
+    anchor's proprio is folded in as ``state_cond``; ``proprio_dropout`` zeroes
+    that ``state_cond`` (the encoder *output*) per sample so a dropped anchor
+    contributes nothing — identical to the plan-time rollout, which passes
+    ``state_cond=None`` because proprio is unobserved there. For logging parity
+    with :func:`prediction_loss`, the 1-step term is reported as ``pred_loss``
+    and horizons ≥2 as ``rollout_loss``.
     """
     emb, emb_for_reg = _compute_emb(model, batch)  # (B, T, N, hidden)
     if emb.dim() != 4:
@@ -318,18 +328,21 @@ def prefix_prediction_loss(
     pe = model.proprio_encoder
     if pe is not None and "proprio" in batch:
         prop0 = batch["proprio"][:, a0].float()  # (B, P): anchor proprio
-        if proprio_dropout > 0.0 and getattr(model, "training", False):
-            keep = (
-                torch.rand(prop0.shape[0], 1, device=prop0.device)
-                >= proprio_dropout
-            ).to(prop0.dtype)
-            prop0 = prop0 * keep
         state_cond = pe(prop0)  # (B, hidden)
+        if proprio_dropout > 0.0 and getattr(model, "training", False):
+            # Zero the encoder OUTPUT (not the input) so a dropped anchor adds
+            # nothing — matching the plan-time ``state_cond=None`` regime.
+            keep = (
+                torch.rand(state_cond.shape[0], 1, device=state_cond.device)
+                >= proprio_dropout
+            ).to(state_cond.dtype)
+            state_cond = state_cond * keep
 
     pred = model.predict_prefix(anchor, act_emb, state_cond)  # (B, k, N, hidden)
 
     pred_loss = (pred[:, :1] - targets[:, :1]).pow(2).mean()
-    if rollout_weight > 0 and k >= 2:
+    has_rollout = rollout_weight > 0 and k >= 2
+    if has_rollout:
         rollout_loss = (pred[:, 1:] - targets[:, 1:]).pow(2).mean()
     else:
         rollout_loss = torch.zeros((), device=emb.device)
@@ -344,7 +357,9 @@ def prefix_prediction_loss(
         "pred_loss": pred_loss.detach(),
         "rollout_loss": rollout_loss.detach(),
         "reg_loss": reg_loss.detach(),
-        "n_rollout_steps": max(0, k - 1),
+        # Number of supervised rollout horizons (0 when the rollout term is
+        # off), matching prediction_loss's ``len(rollout_losses)`` semantics.
+        "n_rollout_steps": (k - 1) if has_rollout else 0,
     }
 
 

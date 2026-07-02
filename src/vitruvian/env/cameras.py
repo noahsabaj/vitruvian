@@ -41,7 +41,12 @@ def look_at_quat(
         cam_offset, dtype=np.float64
     )
     fwd /= np.linalg.norm(fwd)
+    # Pick a world "up" that isn't parallel to the view direction, so the
+    # ``fwd × up`` right-vector is well-defined even when the camera looks
+    # straight down/up (fwd == ±Z would make ``cross(fwd, Z)`` zero-length).
     up = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(fwd, up))) > 0.999:
+        up = np.array([0.0, 1.0, 0.0])
     right = np.cross(fwd, up)
     right /= np.linalg.norm(right)
     cam_up = np.cross(right, fwd)

@@ -12,7 +12,6 @@ import argparse
 import time
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
@@ -70,6 +69,10 @@ def main() -> None:
         if cfg.get("policy_ckpt")
         else None
     )
+    # Resolve a relative policy_ckpt against the repo root so the shipped
+    # configs (e.g. ``checkpoints/m1-g1-full/...``) work from any CWD.
+    if policy_ckpt is not None and not policy_ckpt.is_absolute():
+        policy_ckpt = repo_root / policy_ckpt
     env_ctx = build_env_and_policy(
         ckpt_policy=policy_ckpt,
         device=device,
@@ -110,6 +113,7 @@ def main() -> None:
         iterations=int(plan_cfg.get("iterations", 3)),
         history_size=int(plan_cfg.get("history_size", 3)),
         device=device,
+        seed=args.seed,  # reproducible MPPI sample cloud
     )
 
     # Encode-once history. The world model is per-step, so the history
@@ -123,7 +127,8 @@ def main() -> None:
         """Encode + retain the current head-cam frame (visual-only)."""
         pix = render_head_cam(env_ctx)
         pix_chw = torch.from_numpy(pix).permute(2, 0, 1).contiguous()
-        history.push(pix_chw)
+        with torch.no_grad():  # history frames feed inference only — no graph
+            history.push(pix_chw)
 
     n_macros = int(cfg.get("n_macros", 10))
     frames: list[np.ndarray] = []
@@ -182,6 +187,11 @@ def main() -> None:
             f"best_cost={planner.best_cost:.4f}  "
             f"torso_xyz=({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})"
         )
+        # Abort if the robot has fallen (torso z < 0.3 m) — no point planning
+        # from a collapsed pose (mirrors vit-eval's fall guard).
+        if float(xyz[2]) < 0.3:
+            print(f"[plan] torso fell (z={float(xyz[2]):.2f} < 0.3) — stopping")
+            break
 
     print(f"=== plan done in {time.perf_counter() - t0:.1f}s ===")
 

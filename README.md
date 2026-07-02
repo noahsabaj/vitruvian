@@ -15,12 +15,13 @@
 installable Python library in M4.8 + M4.9 + M4.9.1:
 
 - `uv pip install -e .` exposes `vit-train`, `vit-plan`, `vit-eval`,
-  `vit-collect` as console scripts, each driven by a YAML config.
+  `vit-collect`, `vit-rollout` as console scripts, each driven by a YAML
+  config.
 - Single `JEPA` class + `build_jepa` / `load_jepa` registry subsumes
-  the three milestone-specific composers.
+  the milestone-specific composers.
 - `MPPIPlanner` with pluggable `CostFn` strategies, `JEPATrainer`
   shared training loop, `EncoderHistory` encode-once ring buffer.
-- Vendored LeWM (retired submodule), 48-test CPU suite in under 15s.
+- Vendored LeWM (retired submodule), 88-test CPU suite in under 30s.
 
 Under [ADR 006](docs/decisions/006-g1-reference-body.md), **Unitree G1
 is Vitruvian's reference body for the foreseeable future** — the
@@ -59,16 +60,17 @@ uv sync
 CLI entry points (each takes a YAML config + optional dotted overrides):
 
 ```bash
-uv run vit-train configs/train/jepa_v5.yaml --override trainer.lr=3e-5
-uv run vit-plan  configs/plan/forward_walk.yaml
-uv run vit-eval  configs/eval/17_run_matrix.yaml
+uv run vit-train   configs/train/jepa_v5.yaml --override trainer.lr=3e-5
+uv run vit-plan    configs/plan/forward_walk.yaml
+uv run vit-eval    configs/eval/17_run_matrix.yaml
 uv run vit-collect configs/collect/diverse.yaml
+uv run vit-rollout configs/eval/rollout_accuracy.yaml  # open-loop rollout accuracy (Q1a)
 ```
 
 Tests:
 
 ```bash
-uv run pytest            # 48 tests, ~15s, CPU-only (backbones mocked)
+uv run pytest            # 88 tests, ~30s, CPU-only (backbones mocked)
 ```
 
 ## License

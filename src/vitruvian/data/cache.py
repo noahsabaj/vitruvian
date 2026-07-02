@@ -25,25 +25,29 @@ encoder model changes). This module centralizes all of that.
 
   * Caches are SHA-keyed on (source HDF5 path + size + mtime, encoder
     model ID, encoding-mode). A new HDF5 or a new DINOv3 release
-    invalidates.
-  * Metadata lives alongside the `.pt` in a `.json` sidecar.
+    invalidates. The encoder *dtype* is intentionally NOT in the key
+    (caches are always built at the builder's default precision); it is
+    recorded in the metadata sidecar for inspection. mtime is truncated
+    to whole seconds, so a same-size in-place replacement within one
+    second is a (rare) stale-HIT footgun.
+  * Metadata lives alongside the `.pt` in a `.json` sidecar; both are
+    written atomically (temp file + rename) so a crash mid-write leaves
+    a clean MISS, not a truncated sidecar.
   * The cache tensor is always on CPU; callers move to GPU per batch.
   * ``from_precompute(...)`` is the one-stop entry that either loads
     the cache (HIT) or computes and writes it (MISS).
 
-Callers after M4.7:
-  * `scripts/m4e_train_jepa_v4.py:precompute_embeddings` → replaced by
-    ``EmbeddingCache.from_precompute(mode="cls")``.
-  * `scripts/m4f_train_jepa_v5.py:precompute_patch_embeddings` →
-    ``mode="patch2"`` (spatial_stride=2 → 7×7 = 49 tokens).
-  * `scripts/m4e_train_vf_her.py` → ``load`` (never computes, reuses
-    the v4/v5 training cache).
+Entry points now live in :mod:`vitruvian.data.precompute`
+(``build_cls_cache`` / ``build_patch_cache``, driven by ``vit-train``);
+``vit-rollout`` uses :meth:`EmbeddingCache.load` to reuse the training
+cache without ever recomputing.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,18 +128,32 @@ class EmbeddingCache:
     @classmethod
     def load(cls, cache_dir: Path, key: CacheKey) -> "EmbeddingCache | None":
         """Try to load the cache. Returns ``None`` on miss — caller
-        decides whether to compute it."""
+        decides whether to compute it.
+
+        Treated as a MISS (``None``), never an exception: the source HDF5
+        being gone (the key can't be computed without its size+mtime) and a
+        truncated/corrupt sidecar (e.g. from a crash mid-write in an older
+        build). This keeps the documented "returns None on miss" contract for
+        the load-only flows (``vit-rollout``, the VF trainer)."""
         cache_dir = Path(cache_dir)
-        pt_path = cache_dir / key.filename()
-        meta_path = cache_dir / key.meta_filename()
+        try:
+            pt_path = cache_dir / key.filename()
+            meta_path = cache_dir / key.meta_filename()
+        except FileNotFoundError:
+            # Source HDF5 missing → fingerprint (size+mtime) can't be computed,
+            # so the cache is unfindable — a miss, not a crash.
+            return None
         if not (pt_path.exists() and meta_path.exists()):
             return None
+        try:
+            with meta_path.open("r") as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None  # corrupt/half-written sidecar → recompute
         # mmap=True keeps RSS ~O(batch) instead of reading the whole file.
         tensor = torch.load(
             pt_path, map_location="cpu", weights_only=True, mmap=True
         )
-        with meta_path.open("r") as f:
-            metadata = json.load(f)
         return cls(pt_path, meta_path, tensor, metadata)
 
     @classmethod
@@ -171,9 +189,16 @@ class EmbeddingCache:
         elapsed = time.perf_counter() - t0
         pt_path = cache_dir / key.filename()
         meta_path = cache_dir / key.meta_filename()
-        torch.save(tensor, pt_path)
-        with meta_path.open("w") as f:
+        # Write to temp files then atomically rename, sidecar LAST: a crash
+        # can't leave a truncated .json or a .pt with no metadata (load()
+        # requires BOTH to exist, so a partial write reads as a clean miss).
+        pt_tmp = pt_path.with_name(pt_path.name + ".tmp")
+        meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+        torch.save(tensor, pt_tmp)
+        with meta_tmp.open("w") as f:
             json.dump(metadata, f, indent=2)
+        os.replace(pt_tmp, pt_path)
+        os.replace(meta_tmp, meta_path)
         if verbose:
             size_gb = pt_path.stat().st_size / 1e9
             print(

@@ -17,13 +17,19 @@ Top-level subpackages:
 * ``vitruvian.lewm_compat`` — vendored subset of external LeWM
   (``Embedder``, ``ARPredictor``, ``MLP``, ``Transformer`` blocks).
 * ``vitruvian.cli`` — ``vit-train`` / ``vit-plan`` / ``vit-eval`` /
-  ``vit-collect`` console-script entrypoints.
-* ``vitruvian.utils`` — config loader, compile/autocast helpers,
-  structured run logging.
+  ``vit-collect`` / ``vit-rollout`` console-script entrypoints.
+* ``vitruvian.utils`` — the YAML config loader and compile/autocast
+  helpers.
 """
 
 __version__ = "0.4.8"
 
 
 def main() -> None:
-    print("Hello from vitruvian!")
+    """Entry point for the bare ``vitruvian`` console script."""
+    print(
+        "Vitruvian — a minimum viable humanoid substrate for machine "
+        "intelligence.\n"
+        "CLI tools: vit-train, vit-plan, vit-eval, vit-collect, vit-rollout.\n"
+        "See the README and docs/roadmap.md to get started."
+    )

@@ -2,9 +2,8 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: ['**']  # every branch — feature branches get CI before the PR
   pull_request:
-    branches: [main]
   workflow_dispatch:  # allow manual runs from the Actions tab
 
 # Cancel redundant runs on the same branch when new commits land.

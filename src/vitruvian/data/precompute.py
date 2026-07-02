@@ -6,16 +6,18 @@ Wraps :class:`EmbeddingCache.from_precompute` with the correct
 :class:`CacheKey` + compute-fn for each supported latent shape. Running
 either function:
 
-1. Loads the frozen DINOv3 backbone.
-2. Compiles it (``torch.compile(mode="reduce-overhead")``).
-3. Encodes every frame in the HDF5 under ``bf16_autocast``, streaming
-   pixel batches from disk so we never hold the full tensor in RAM.
-4. Writes a SHA-keyed ``.pt`` + ``.json`` next to each other in
-   ``cache_dir``.
-5. Frees the DINOv3 VRAM (344 MB) so the subsequent training run gets
+1. Loads the frozen DINOv3 backbone (fp16 weights by default) and
+   compiles it (``torch.compile(mode="reduce-overhead")``).
+2. Encodes every frame in the HDF5 under ``bf16_autocast``, streaming
+   *pixel* batches from disk so the input frames are never all in RAM at
+   once. The full *output* embedding tensor IS materialized in host RAM
+   during the MISS (``torch.empty(out_shape)`` — ~20 GB for patch v5);
+   the mmap only applies on the subsequent re-load.
+3. Writes a SHA-keyed ``.pt`` + ``.json`` (atomically) in ``cache_dir``.
+4. Frees the DINOv3 VRAM (344 MB) so the subsequent training run gets
    the full budget.
-6. Re-loads the tensor via ``mmap=True`` for working-set RAM
-   proportional to batch size, not the total (20 GB for patch v5).
+5. Re-loads the tensor via ``mmap=True`` for working-set RAM
+   proportional to batch size, not the total.
 
 These functions replace the near-identical
 ``precompute_embeddings`` / ``precompute_patch_embeddings`` helpers
@@ -118,6 +120,9 @@ def _build_cls_compute_fn(
             "model_id": model_id,
             "n_total": n_total,
             "dim": int(backbone.output_dim),
+            # Recorded for inspection; NOT part of the cache key (see
+            # data.cache.CacheKey) — changing precision won't auto-invalidate.
+            "encoder_dtype": str(dtype),
         }
         del backbone
         if device.startswith("cuda"):
@@ -164,6 +169,9 @@ def _build_patch_compute_fn(
             "n_total": n_total,
             "n_patches": int(n_patches),
             "patch_dim": int(patch_dim),
+            # Recorded for inspection; NOT part of the cache key (see
+            # data.cache.CacheKey) — changing precision won't auto-invalidate.
+            "encoder_dtype": str(dtype),
         }
         del backbone
         if device.startswith("cuda"):
@@ -188,7 +196,8 @@ def build_cls_cache(
     dtype: torch.dtype = torch.float16,
 ) -> EmbeddingCache:
     """HIT returns the mmap view; MISS runs DINOv3 over all frames
-    (compiled + BF16) and writes the ``(N, D)`` fp32 cache."""
+    (compiled; ``dtype`` weights — fp16 by default — under bf16 autocast)
+    and writes the ``(N, D)`` fp32 cache."""
     key = CacheKey(
         h5_path=Path(h5_path), model_id=model_id, mode="cls"
     )
@@ -216,8 +225,9 @@ def build_patch_cache(
     dtype: torch.dtype = torch.float16,
 ) -> EmbeddingCache:
     """HIT returns the mmap view; MISS runs DINOv3 over all frames
-    (compiled + BF16) and writes the ``(N, n_patches, patch_dim)`` fp16
-    cache — ~20 GB for 267k frames at 7×7 patches."""
+    (compiled; ``dtype`` weights — fp16 by default — under bf16 autocast)
+    and writes the ``(N, n_patches, patch_dim)`` fp16 cache — ~20 GB for
+    267k frames at 7×7 patches."""
     key = CacheKey(
         h5_path=Path(h5_path),
         model_id=model_id,
